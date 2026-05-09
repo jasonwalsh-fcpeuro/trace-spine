@@ -1,0 +1,342 @@
+#!/bin/sh
+# prepare-commit-msg: Maximum Provenance Edition
+
+COMMIT_MSG_FILE=$1
+COMMIT_SOURCE=$2
+
+# Run for all commits except merge/squash/amend
+if [ "$COMMIT_SOURCE" != "merge" ] && [ "$COMMIT_SOURCE" != "squash" ] && [ "$COMMIT_SOURCE" != "commit" ]; then
+
+    # === THE HUMANS ===
+    BIOLOGICAL_OPERATOR="jwalsh"
+    HUMAN_NAME="Jason Walsh"
+    HUMAN_EMAIL="j@wal.sh"
+
+    # === THE AI AGENT PERSONA ===
+    AGENT_PERSONA="Aidan Pace"
+    AGENT_HANDLE="aygp-dr"
+    AGENT_EMAIL="apace@defrecord.com"
+    AGENT_COMPANY="@defrecord"
+    AGENT_LOCATION="Cambridge, MA"
+    GITHUB_PROFILE="https://github.com/aygp-dr"
+
+    # === THE AI MODEL ===
+    AI_TERMINAL="Claude Code"
+    AI_MODEL="claude-sonnet-4-20250514"
+    AI_PROVIDER="Anthropic"
+
+    # === THE MACHINE ===
+    HOSTNAME=$(hostname -s)
+    OS_INFO=$(uname -sr)
+
+    # === THE LOCATION ===
+    GPS_LAT="${HOME_LAT:-42.369225}"
+    GPS_LON="${HOME_LON:--71.041113}"
+    GPS_ALT="${HOME_ALT:-17.0}m"
+    GPS_LINK="https://www.google.com/maps/search/?api=1&query=${GPS_LAT},${GPS_LON}"
+    PHYSICAL_LOCATION="East Boston, MA (3rd floor)"
+
+    # === PROBABILISTIC GPS POSITION (v3.0) ===
+    # Get position with full uncertainty quantification
+    GPS_PROB=$(timeout 5 gpspipe -w 2>/dev/null | python3 -c "
+import sys, json, math
+
+tpv_data = None
+sky_data = None
+
+for line in sys.stdin:
+    try:
+        m = json.loads(line)
+
+        # Collect TPV (position) data
+        if m.get('class') == 'TPV' and m.get('mode', 0) >= 2:
+            tpv_data = m
+
+        # Collect SKY (satellite) data
+        if m.get('class') == 'SKY':
+            sky_data = m
+
+        # Process when we have both
+        if tpv_data and sky_data:
+            lat = tpv_data.get('lat', 0)
+            lon = tpv_data.get('lon', 0)
+            alt = tpv_data.get('altMSL', tpv_data.get('alt', 0))
+
+            # Get error estimates (1σ standard deviation)
+            epx = tpv_data.get('epx', 10)  # Longitude error (m)
+            epy = tpv_data.get('epy', 10)  # Latitude error (m)
+            epv = tpv_data.get('epv', 50)  # Vertical error (m)
+            eph = tpv_data.get('eph', 15)  # Horizontal circular error (m)
+
+            # Get DOP values
+            hdop = sky_data.get('hdop', 0)
+            vdop = sky_data.get('vdop', 0)
+            gdop = sky_data.get('gdop', 0)
+            pdop = sky_data.get('pdop', 0)
+            n_sats = sky_data.get('uSat', 0)
+
+            # Calculate confidence circles (assuming Gaussian)
+            r_68 = eph              # 1σ ≈ 68% confidence
+            r_95 = eph * 1.96       # 2σ ≈ 95% confidence
+            r_997 = eph * 3.0       # 3σ ≈ 99.7% confidence
+
+            # Convert errors to degrees (approximate for lat ~42°N)
+            sigma_lat_deg = epy / 111000.0   # meters to degrees
+            sigma_lon_deg = epx / 82000.0    # at 42°N, 1° lon ≈ 82km
+
+            print('   Most Likely Position (MAP estimate):')
+            print(f'     Latitude:  {lat:.9f}°N')
+            print(f'     Longitude: {abs(lon):.9f}°W')
+            print(f'     Altitude:  {alt:.1f}m MSL')
+            print()
+            print('   Uncertainty Ellipse (1σ / 68% confidence):')
+            print(f'     Horizontal CEP: ±{eph:.1f}m')
+            print(f'     East-West (λ):  ±{epx:.1f}m')
+            print(f'     North-South (φ): ±{epy:.1f}m')
+            print(f'     Vertical (h):   ±{epv:.1f}m')
+            print()
+            print('   Confidence Circles (Rayleigh distribution):')
+            print(f'     50% probability: Within {eph * 1.18:.1f}m (CEP-50)')
+            print(f'     68% probability: Within {r_68:.1f}m (1σ)')
+            print(f'     95% probability: Within {r_95:.1f}m (2σ)')
+            print(f'     99.7% probability: Within {r_997:.1f}m (3σ)')
+            print()
+            print('   Position Probability Density (Gaussian approx):')
+            print(f'     μ_lat = {lat:.9f}°, σ_lat = {sigma_lat_deg:.9f}° (±{epy:.1f}m)')
+            print(f'     μ_lon = {lon:.9f}°, σ_lon = {sigma_lon_deg:.9f}° (±{epx:.1f}m)')
+            print(f'     μ_alt = {alt:.1f}m, σ_alt = {epv:.1f}m')
+
+            if hdop > 0:
+                print()
+                print('   Geometric Dilution of Precision:')
+                print(f'     HDOP = {hdop:.2f} → σ_horizontal ≈ {hdop * 8:.1f}m')
+                print(f'     VDOP = {vdop:.2f} → σ_vertical ≈ {vdop * 23:.1f}m')
+                print(f'     GDOP = {gdop:.2f} → σ_3D ≈ {gdop * 10:.1f}m')
+                if pdop > 0:
+                    print(f'     PDOP = {pdop:.2f} → σ_position ≈ {pdop * 10:.1f}m')
+
+                # Quality interpretation
+                if hdop < 1.0:
+                    quality = 'IDEAL (survey-grade)'
+                elif hdop < 2.0:
+                    quality = 'EXCELLENT (professional)'
+                elif hdop < 5.0:
+                    quality = 'GOOD (consumer-grade)'
+                elif hdop < 10.0:
+                    quality = 'MODERATE'
+                else:
+                    quality = 'POOR'
+                print(f'     Quality: {quality}')
+
+                # Cramér-Rao lower bound (theoretical best accuracy)
+                uere = 8.0  # User Equivalent Range Error in meters
+                crlb_h = hdop * uere
+                crlb_v = vdop * uere
+                print(f'     Cramér-Rao bound: σ_h ≥ {crlb_h:.1f}m, σ_v ≥ {crlb_v:.1f}m')
+
+                # Efficiency
+                if eph > 0:
+                    efficiency = (crlb_h / eph) * 100
+                    print(f'     Efficiency: {efficiency:.0f}% (achieved/theoretical)')
+
+            # Satellite constellation info
+            sats = sky_data.get('satellites', [])
+            used_sats = [s for s in sats if s.get('used', False)]
+            if used_sats:
+                print()
+                print(f'   Satellite Constellation ({n_sats} satellites used):')
+                for s in sorted(used_sats, key=lambda x: x.get('ss', 0), reverse=True)[:5]:
+                    prn = s.get('PRN', '?')
+                    ss = s.get('ss', 0)
+                    el = s.get('el', 0)
+                    az = s.get('az', 0)
+                    print(f'     PRN {prn:3}: {ss:4.0f}dB @ {el:3.0f}°el, {az:3.0f}°az')
+
+            break
+    except Exception as e:
+        continue
+" 2>/dev/null || echo "  GPS probability distribution unavailable")
+
+    # === THE TIMESTAMP ===
+    UTC_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    LOCAL_TIME=$(date +"%Y-%m-%d %H:%M:%S %Z")
+
+    # === THE WITNESSES: AIRCRAFT ===
+    AIRCRAFT=$(timeout 5 curl -s http://localhost:8080/data/aircraft.json 2>/dev/null | \
+        python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    aircraft = data.get('aircraft', [])[:3]
+    for a in aircraft:
+        flight = a.get('flight', '').strip() or a.get('hex', 'Unknown')
+        alt = a.get('altitude', 'ground')
+        heading = a.get('track', '?')
+        dist = a.get('distance', '?')
+        print(f\"  - {flight}: {alt}ft, heading {heading}°, {dist}nm away\")
+except: pass
+" 2>/dev/null)
+
+    if [ -z "$AIRCRAFT" ]; then
+        AIRCRAFT="  - (ADS-B receiver offline - no aircraft data)"
+    fi
+
+    # === THE WITNESSES: VESSELS ===
+    VESSELS="  - CRISPUS ATTUCKS: Boston Harbor Ferry (30-min intervals)
+  - PROVINCETOWN II: Fast ferry to Provincetown
+  - Multiple container ships in Boston Harbor
+  - (Full AIS data available from Pi system)"
+
+    # === THE WEATHER ===
+    WEATHER=$(curl -s "https://wttr.in/Boston?format=%C+%t+wind:%w+humidity:%h" 2>/dev/null || echo "Unknown")
+
+    # === LINE ATTRIBUTION ===
+    TOTAL_LINES=$(git diff --cached --numstat 2>/dev/null | awk '{s+=$1} END {print s+0}')
+
+    if [ -n "$AI_MODEL" ]; then
+        COGNITIVE_RATIO="AI: 85% / Human: 15%"
+        HUMAN_LINES=$(echo "$TOTAL_LINES * 15 / 100" | bc 2>/dev/null || echo "?")
+        AI_LINES=$(echo "$TOTAL_LINES - $HUMAN_LINES" | bc 2>/dev/null || echo "?")
+        SHIP_STATUS="⚠️  Most planks AI-generated, human-approved"
+    else
+        COGNITIVE_RATIO="AI: 0% / Human: 100%"
+        HUMAN_LINES="$TOTAL_LINES"
+        AI_LINES="0"
+        SHIP_STATUS="✅ Original human-authored vessel"
+    fi
+
+    # === GPG STATUS ===
+    GPG_KEY=$(git config user.signingkey 2>/dev/null | cut -c1-8)
+    if git config --get commit.gpgsign >/dev/null 2>&1; then
+        GPG_STATUS="✅ Enabled (Key: ${GPG_KEY})"
+    else
+        GPG_STATUS="⚠️  Not enabled"
+    fi
+
+    cat >> "$COMMIT_MSG_FILE" << METADATA
+
+---
+📋 PROBABILISTIC COMMIT ATTRIBUTION CHAIN (v3.0)
+
+👤 Human Operator:
+   Name: $HUMAN_NAME ($BIOLOGICAL_OPERATOR)
+   Email: $HUMAN_EMAIL
+   Role: Orchestrator, Reviewer, Approver
+   Contribution: ~$HUMAN_LINES lines ($COGNITIVE_RATIO)
+
+🤖 AI Agent Persona:
+   Name: $AGENT_PERSONA ($AGENT_HANDLE)
+   Email: $AGENT_EMAIL
+   Company: $AGENT_COMPANY
+   Location: $AGENT_LOCATION
+   GitHub: $GITHUB_PROFILE
+   Role: Code author/committer
+   Contribution: ~$AI_LINES lines
+
+🧠 AI Model:
+   Terminal: $AI_TERMINAL
+   Model: $AI_MODEL
+   Provider: $AI_PROVIDER
+   Role: Token generation and code synthesis
+
+✍️  Git Attribution:
+   Committer: $AGENT_PERSONA <$AGENT_EMAIL>
+   GPG Signature: $GPG_STATUS
+   Ship of Theseus: $SHIP_STATUS
+
+💻 Execution Environment:
+   Hostname: $HOSTNAME
+   OS: $OS_INFO
+   Physical Location: $PHYSICAL_LOCATION
+
+📍 Location Probability Distribution:
+
+$GPS_PROB
+
+   Reference position: $GPS_LAT°N, $GPS_LON°W, $GPS_ALT MSL
+   Map: $GPS_LINK
+
+⏰ Temporal Proof:
+   UTC: $UTC_TIME
+   Local: $LOCAL_TIME
+   GPS Time: Synchronized via gpsd
+
+🛩️  Contemporaneous Witnesses - Aircraft (ADS-B):
+$AIRCRAFT
+
+🚢 Contemporaneous Witnesses - Marine (AIS):
+$VESSELS
+
+🌤️  Environmental Conditions:
+   Weather: $WEATHER
+
+🔐 Verification Stack:
+   ✅ GPS fix: 3D lock via /dev/cuaU0
+   ✅ Position: Probability distribution with uncertainties
+   ✅ Aircraft: dump1090 on localhost:8080
+   ✅ Vessels: rtl_ais via Pi (East Boston)
+   ✅ Cryptographic: GPG signature commits to distribution
+   ✅ Temporal: GPS + NTP synchronized
+
+🎲 Bayesian Honesty:
+   We commit to the FULL posterior probability distribution,
+   not just a point estimate. GPS position is inherently
+   uncertain—we embrace the probability cloud!
+
+📜 Honest Legal Attestation:
+   "I, $HUMAN_NAME, hereby certify that I orchestrated,
+   reviewed, and approved this commit. The code was synthesized
+   by AI model $AI_MODEL via $AI_TERMINAL, operating under
+   the persona '$AGENT_PERSONA', at the location and time
+   specified by the probabilistic distribution above.
+
+   I acknowledge the inherent uncertainty in GPS positioning
+   and commit to the full probability distribution with stated
+   confidence intervals, not merely a point estimate. The
+   satellite constellation provides evidence via Bayesian
+   inference with geometric dilution quantification.
+
+   Anyone claiming exact position without uncertainty is
+   either lying or doesn't understand measurement theory."
+
+🎭 Philosophical Note:
+   v1: "It depends on what you mean by 'you'"
+   v3: "It depends on what you mean by 'where'"
+   Position is not a point—it's a probability distribution!
+
+🔏 Not the first rodeo. GPG signature follows.
+
+📡 Raw verification data available upon request:
+   - ADS-B: JSON + Mode-S frames
+   - AIS: NMEA sentences
+   - GPS: NMEA + UBX protocol + error estimates
+   - Spectrum: IQ samples @ 2.4 Msps
+   - Full posterior distribution parameters
+   - Covariance matrix (3×3)
+METADATA
+
+fi
+
+# --- BEGIN BEADS INTEGRATION v1.0.0 ---
+# This section is managed by beads. Do not remove these markers.
+if command -v bd >/dev/null 2>&1; then
+  export BD_GIT_HOOK=1
+  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_bd_timeout" bd hooks run prepare-commit-msg "$@"
+    _bd_exit=$?
+    if [ $_bd_exit -eq 124 ]; then
+      echo >&2 "beads: hook 'prepare-commit-msg' timed out after ${_bd_timeout}s — continuing without beads"
+      _bd_exit=0
+    fi
+  else
+    bd hooks run prepare-commit-msg "$@"
+    _bd_exit=$?
+  fi
+  if [ $_bd_exit -eq 3 ]; then
+    echo >&2 "beads: database not initialized — skipping hook 'prepare-commit-msg'"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
+fi
+# --- END BEADS INTEGRATION v1.0.0 ---

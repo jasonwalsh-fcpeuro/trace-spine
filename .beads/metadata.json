@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "trace_spine",
+  "project_id": "572e5a2f-a5ae-4f2e-bc0e-15302bae2982"
+}
