@@ -1,0 +1,104 @@
+{:paths ["src" "resources"]
+
+ :deps
+ {;; Core Clojure
+  org.clojure/clojure {:mvn/version "1.12.0"}
+  org.clojure/core.async {:mvn/version "1.6.681"}
+
+  ;; trace-spine library (local dep)
+  io.github.aygp-dr/trace-spine {:local/root "../../lib/clj"}
+
+  ;; HTTP server
+  ring/ring-core {:mvn/version "1.12.1"}
+  ring/ring-jetty-adapter {:mvn/version "1.12.1"}
+  ring/ring-json {:mvn/version "0.5.1"}
+  metosin/reitit {:mvn/version "0.7.0"}
+  metosin/reitit-ring {:mvn/version "0.7.0"}
+  metosin/reitit-spec {:mvn/version "0.7.0"}
+
+  ;; OpenTelemetry
+  io.opentelemetry/opentelemetry-api {:mvn/version "1.36.0"}
+  io.opentelemetry/opentelemetry-sdk {:mvn/version "1.36.0"}
+  io.opentelemetry/opentelemetry-exporter-otlp {:mvn/version "1.36.0"}
+  io.opentelemetry/opentelemetry-context {:mvn/version "1.36.0"}
+
+  ;; Kafka
+  org.apache.kafka/kafka-clients {:mvn/version "3.7.0"}
+  io.confluent/kafka-json-schema-serializer {:mvn/version "7.6.0"}
+
+  ;; Database
+  com.github.seancorfield/next.jdbc {:mvn/version "1.3.925"}
+  org.postgresql/postgresql {:mvn/version "42.7.3"}
+  com.zaxxer/HikariCP {:mvn/version "5.1.0"}
+  com.github.seancorfield/honeysql {:mvn/version "2.6.1126"}
+
+  ;; HTTP client (for ShipStation)
+  clj-http/clj-http {:mvn/version "3.12.3"}
+
+  ;; JSON
+  metosin/jsonista {:mvn/version "0.3.8"}
+  metosin/malli {:mvn/version "0.15.0"}
+
+  ;; Logging
+  org.clojure/tools.logging {:mvn/version "1.3.0"}
+  ch.qos.logback/logback-classic {:mvn/version "1.5.3"}
+  net.logstash.logback/logstash-logback-encoder {:mvn/version "7.4"}
+
+  ;; Component lifecycle
+  integrant/integrant {:mvn/version "0.10.0"}
+
+  ;; Utilities
+  clj-time/clj-time {:mvn/version "0.15.2"}
+  buddy/buddy-core {:mvn/version "1.11.423"}}
+
+ :aliases
+ {:dev
+  {:extra-paths ["dev" "test"]
+   :extra-deps
+   {integrant/repl {:mvn/version "0.4.0"}
+    ring/ring-mock {:mvn/version "0.4.0"}
+    lambdaisland/kaocha {:mvn/version "1.91.1392"}}}
+
+  :test
+  {:extra-paths ["test"]
+   :extra-deps
+   {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+    nubank/matcher-combinators {:mvn/version "3.9.1"}
+    io.github.cognitect-labs/test-runner {:git/tag "v0.5.1"
+                                          :git/sha "dfb30dd"}}
+   :main-opts ["-m" "kaocha.runner"]}
+
+  :uberjar
+  {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
+   :main-opts ["-m" "hf.depstar.uberjar"
+               "target/wms.jar"
+               "-m" "wms.main"]}
+
+  :repl
+  {:extra-deps
+   {nrepl/nrepl {:mvn/version "1.1.1"}
+    cider/cider-nrepl {:mvn/version "0.47.1"}}
+   :main-opts ["-m" "nrepl.cmdline"
+               "--middleware" "[cider.nrepl/cider-middleware]"]}
+
+  :run
+  {:main-opts ["-m" "wms.main"]}
+
+  :outdated
+  {:extra-deps {com.github.liquidz/antq {:mvn/version "2.8.1185"}}
+   :main-opts ["-m" "antq.core"]}
+
+  :docs
+  {:extra-deps {io.github.weavejester/codox {:git/tag "0.10.8"
+                                              :git/sha "d686e50"}}
+   :exec-fn codox.main/generate-docs
+   :exec-args {:source-paths ["src"]
+               :output-path "target/docs"}}
+
+  :generate-code-diagram
+  {:extra-paths ["docs"]
+   :main-opts ["-m" "docs.generate-code-diagram"]}}
+
+ ;; Confluent Maven repo for Kafka schema registry
+ :mvn/repos
+ {"confluent" {:url "https://packages.confluent.io/maven/"}}}

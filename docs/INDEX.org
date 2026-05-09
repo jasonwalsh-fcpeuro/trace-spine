@@ -1,0 +1,197 @@
+#+title: Documentation Index
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:2 num:t
+
+* Overview
+
+This document serves as the central navigation point for all trace-spine documentation.
+trace-spine is the wire-discipline library and CI harness that enforces W3C traceparent
+propagation across every wire crossing in the Petstore Commerce Platform.
+
+* Quick Links
+
+| Document | Purpose | Audience |
+|----------|---------|----------|
+| [[file:../README.md][README.md]] | Project overview | All |
+| [[file:../AGENTS.md][AGENTS.md]] | Agent instructions | Agents |
+| [[file:../CLAUDE.md][CLAUDE.md]] | Build/test commands | All |
+| [[file:DOCUMENTATION.org][DOCUMENTATION.org]] | Documentation mandate | Maintainers |
+
+* Specification (spec/)
+
+The spec is the source of truth for wire format, function contracts, and invariants.
+
+** Progressive Hardening Levels
+
+| Level | Document | Purpose |
+|-------|----------|---------|
+| L0 | [[file:../spec/L0-claims.org][L0-claims.org]] | Named invariants (I-spine-*) with refutation conditions |
+| L1 | [[file:../spec/L1-wire.org][L1-wire.org]] | Wire format (W3C Trace Context v00) |
+| L1 | [[file:../spec/L1-contracts.org][L1-contracts.org]] | Function contracts (extract, inject, middleware) |
+| L2 | [[file:../spec/L2-properties.org][L2-properties.org]] | Property tests |
+| -- | [[file:../spec/cprr.org][cprr.org]] | Conjecture tracking (CPRR table) |
+
+** Key Invariants
+
+| ID | Claim | Refutation |
+|----|-------|------------|
+| I-spine-present | Every crossing has traceparent | Missing header observed |
+| I-spine-wellformed | traceparent matches W3C syntax | Regex validation fails |
+| I-spine-monotonic | Trace ID preserved in causal cone | Different trace IDs in same trace |
+| I-spine-no-fabrication | Only ingress creates trace IDs | Internal service originates trace |
+| I-spine-no-leak | Trace IDs redacted from user-visible output | Trace ID in response/log |
+| I-spine-budget | Propagation < 50us p99 | Benchmark exceeds budget |
+
+* Architecture (docs/architecture/)
+
+** C4 Diagrams
+
+| Document | Content |
+|----------|---------|
+| [[file:architecture/c4/system-landscape.org][system-landscape.org]] | All four C4 levels in one file |
+
+Levels within system-landscape.org:
+- Level 1: System Context (users, external systems)
+- Level 2: Container Diagram (services, data stores)
+- Level 3: Component Diagrams (per-service internals)
+- Level 4: Code diagrams (references to platform/<svc>/docs/)
+
+** Architecture Decision Records (ADRs)
+
+| ADR | Title |
+|-----|-------|
+| [[file:architecture/adr/0001-record-decisions.md][0001]] | Record architecture decisions |
+| [[file:architecture/adr/0002-w3c-trace-context-version-00.md][0002]] | W3C Trace Context version 00 |
+| [[file:architecture/adr/0003-no-internal-origination.md][0003]] | No internal trace origination |
+| [[file:architecture/adr/0004-50us-propagation-budget.md][0004]] | 50us propagation budget |
+| [[file:architecture/adr/0005-cross-substrate-chain-property.md][0005]] | Cross-substrate chain property test |
+| [[file:architecture/adr/0006-aq-deferred-multi-agent.md][0006]] | aq deferred multi-agent |
+| [[file:architecture/adr/0007-stacked-diff-discipline.md][0007]] | Stacked diff discipline |
+| [[file:architecture/adr/0008-cprr-in-git-notes.md][0008]] | CPRR in git notes |
+| [[file:architecture/adr/0009-dual-remote-push.md][0009]] | Dual remote push |
+
+* Working Discipline (docs/working/)
+
+Process documentation for agents and humans.
+
+| Document | Purpose |
+|----------|---------|
+| [[file:working/stacking.org][stacking.org]] | Branch naming, commit trailers |
+| [[file:working/multi-agent.org][multi-agent.org]] | Work-claim protocol |
+| [[file:working/cprr-notes.org][cprr-notes.org]] | Reasoning in git notes |
+| [[file:working/push-policy.org][push-policy.org]] | Dual-remote push |
+| [[file:working/rebuild.org][rebuild.org]] | Rebuild property |
+
+* Planning (docs/planning/)
+
+| Document | Purpose |
+|----------|---------|
+| [[file:planning/first-pr.org][first-pr.org]] | First PR plan |
+| [[file:planning/phase-1-graph.org][phase-1-graph.org]] | Phase 1 dependency graph |
+
+* Platform Services (platform/)
+
+Each service maintains its own documentation.
+
+** Service READMEs
+
+| Service | Description | README |
+|---------|-------------|--------|
+| API Gateway | REST/GraphQL entry point | [[file:../platform/api/README.md][platform/api/README.md]] |
+| WMS | Warehouse management | [[file:../platform/wms/README.md][platform/wms/README.md]] |
+| Payments | Payment orchestration | [[file:../platform/payments/README.md][platform/payments/README.md]] |
+| Wallet | Store credit, gift cards | [[file:../platform/wallet/README.md][platform/wallet/README.md]] |
+| Fraud | Risk scoring | [[file:../platform/fraud/README.md][platform/fraud/README.md]] |
+| Metrics | Analytics, experiments | [[file:../platform/metrics/README.md][platform/metrics/README.md]] |
+| Feature Flags | Flag evaluation | [[file:../platform/feature-flags/README.md][platform/feature-flags/README.md]] |
+
+** Service Documentation Structure
+
+Each service should maintain:
+
+#+begin_example
+platform/<service>/
+  README.md             # Overview and local development
+  docs/
+    api.org             # API reference
+    code-diagram.org    # Code-level diagrams
+#+end_example
+
+* Library Adapters (lib/)
+
+| Language | Directory | Status |
+|----------|-----------|--------|
+| Clojure (JVM) | [[file:../lib/clj/][lib/clj/]] | Planned |
+| ClojureScript | [[file:../lib/cljs/][lib/cljs/]] | Planned |
+| Babashka | [[file:../lib/bb/][lib/bb/]] | Planned |
+| Ruby | [[file:../lib/rb/][lib/rb/]] | Planned |
+| Go | [[file:../lib/go/][lib/go/]] | Planned |
+
+* Conformance (conformance/)
+
+| Item | Purpose |
+|------|---------|
+| [[file:../conformance/][conformance/]] | Conformance harness directory |
+| ~./run.sh~ | Run conformance tests |
+| ~./run-properties.sh~ | Run property tests |
+| ~./bench.sh~ | Benchmark adapters |
+
+* Runbooks (runbooks/)
+
+Operational playbooks in TOML format.
+
+| Runbook | Incident class |
+|---------|----------------|
+| [[file:../runbooks/][runbooks/]] | Runbook directory |
+
+* Skills (skills/)
+
+| Skill | Description |
+|-------|-------------|
+| [[file:../skills/agent-working-discipline/SKILL.md][agent-working-discipline]] | Working discipline for agents |
+
+* Cross-Reference Matrix
+
+How documentation types reference each other:
+
+| From | To | Purpose |
+|------|----|---------|
+| spec/* | ADRs | Rationale for decisions |
+| ADRs | spec/* | Sections they implement |
+| C4 diagrams | spec/L1-wire.org | Trace propagation format |
+| Runbooks | spec/cprr.org | Conjectures they respond to |
+| AGENTS.md | docs/working/* | Detailed process docs |
+| Service READMEs | spec/* | Wire format, invariants |
+
+* Documentation Validation
+
+| Check | Command | Trigger |
+|-------|---------|---------|
+| C4 consistency | ~bin/c4-check~ | Before platform/* commit |
+| Doc structure | ~bin/docs-check~ | CI weekly |
+| ADR index | ~bin/docs-check~ | CI weekly |
+| Link validation | ~bin/docs-check~ | CI weekly |
+
+* Maintenance
+
+** Update Triggers
+
+| Document type | Update when |
+|---------------|-------------|
+| spec/* | Contract change |
+| C4 diagrams | Service boundary change |
+| ADRs | Architectural decision |
+| Working docs | Process change |
+| Runbooks | New incident class |
+| Service READMEs | API change |
+
+** Review Requirements
+
+| Document type | Reviewer |
+|---------------|----------|
+| spec/* | spec-keeper |
+| C4 diagrams | spine-engineer |
+| ADRs | spec-keeper |
+| Runbooks | spine-engineer |
+| Platform docs | Service owner |

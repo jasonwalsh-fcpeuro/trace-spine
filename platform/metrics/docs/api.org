@@ -1,0 +1,550 @@
+#+title: Metrics Platform API Reference
+#+author: trace-spine team
+#+date: 2026-05-09
+#+property: header-args :mkdirp t
+#+options: toc:3 num:t
+
+* Overview
+
+The Metrics Platform provides event collection, A/B experiment assignment, and
+analytics querying for the Petstore Commerce Platform. All APIs propagate
+trace-id for user journey correlation.
+
+** Design Principles
+
+1. *trace-id is the join key* - All events carry traceparent; user journeys
+   are reconstructed by trace-id + session-id aggregation
+2. *Write path is async* - Events are fire-and-forget to Kafka; queries hit
+   pre-aggregated ClickHouse tables
+3. *Experiments are stateless* - Assignment is deterministic hashing; no
+   server state required
+4. *Feature flags drive experiments* - A/B variants map to feature flag
+   evaluation
+
+** System Integration
+
+#+begin_src mermaid :file metrics-integration.png :eval never-export
+flowchart LR
+    SPA[Storefront SPA] -->|events| Collector[Event Collector]
+    Admin[Admin Dashboard] -->|queries| QueryAPI[Query API]
+
+    Collector -->|publish| Kafka[(Kafka)]
+    Kafka -->|consume| Aggregator[Aggregator]
+    Aggregator -->|write| ClickHouse[(ClickHouse)]
+
+    QueryAPI -->|read| ClickHouse
+
+    Experiments[A/B Engine] -->|evaluate| Flags[Feature Flags]
+    Experiments -->|record| Kafka
+
+    SPA -->|assignment| Experiments
+#+end_src
+
+* Event Collection API
+
+** POST /events/batch
+
+Ingest a batch of events. Events are validated, enriched with server timestamp,
+and published to Kafka. Returns immediately after queueing.
+
+*** Request
+
+#+begin_src http
+POST /events/batch HTTP/1.1
+Host: metrics.petstore.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+{
+  "events": [
+    {
+      "type": "impression",
+      "event_id": "evt_abc123",
+      "session_id": "sess_xyz789",
+      "user_id": "usr_456",
+      "timestamp": "2026-05-09T14:30:00Z",
+      "properties": {
+        "product_id": "prod_001",
+        "position": 3,
+        "list_name": "homepage_featured",
+        "experiment_variant": "control"
+      }
+    },
+    {
+      "type": "click",
+      "event_id": "evt_def456",
+      "session_id": "sess_xyz789",
+      "user_id": "usr_456",
+      "timestamp": "2026-05-09T14:30:05Z",
+      "properties": {
+        "product_id": "prod_001",
+        "source": "impression",
+        "source_id": "evt_abc123"
+      }
+    }
+  ]
+}
+#+end_src
+
+*** Response
+
+#+begin_src json
+{
+  "accepted": 2,
+  "rejected": 0,
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+}
+#+end_src
+
+*** Event Types
+
+| Type       | Description                          | Required Properties          |
+|------------+--------------------------------------+------------------------------|
+| impression | Product/content viewed               | product_id, position         |
+| click      | User clicked on element              | element_id or product_id     |
+| add_to_cart| Item added to cart                   | product_id, quantity         |
+| purchase   | Order completed                      | order_id, total              |
+| experiment | Experiment exposure                  | experiment_id, variant       |
+| error      | Client-side error                    | error_type, message          |
+
+*** Event Schema
+
+#+begin_src json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["type", "event_id", "session_id", "timestamp"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["impression", "click", "add_to_cart", "purchase", "experiment", "error"]
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^evt_[a-zA-Z0-9]+$"
+    },
+    "session_id": {
+      "type": "string",
+      "pattern": "^sess_[a-zA-Z0-9]+$"
+    },
+    "user_id": {
+      "type": "string",
+      "pattern": "^usr_[a-zA-Z0-9]+$",
+      "description": "Optional; anonymous sessions allowed"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}
+#+end_src
+
+*** Trace Context
+
+The traceparent header is REQUIRED. Events without valid traceparent are rejected.
+The trace_id from traceparent is stored with every event for journey correlation.
+
+*** Rate Limits
+
+| Scope          | Limit            | Window |
+|----------------+------------------+--------|
+| Per session    | 100 events       | 1s     |
+| Per IP         | 1000 events      | 1s     |
+| Batch size     | 50 events        | -      |
+
+* A/B Experiment Assignment API
+
+** GET /experiments/assign
+
+Get experiment variant assignment for a user/session. Assignment is deterministic
+based on hash(experiment_id + bucketing_key) % 100.
+
+*** Request
+
+#+begin_src http
+GET /experiments/assign?experiment_id=checkout_flow_v2&bucketing_key=usr_456 HTTP/1.1
+Host: metrics.petstore.internal
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+#+end_src
+
+*** Response
+
+#+begin_src json
+{
+  "experiment_id": "checkout_flow_v2",
+  "variant": "treatment",
+  "bucketing_key": "usr_456",
+  "bucket": 73,
+  "metadata": {
+    "started_at": "2026-05-01T00:00:00Z",
+    "allocation": {
+      "control": [0, 49],
+      "treatment": [50, 99]
+    }
+  }
+}
+#+end_src
+
+*** Assignment Algorithm
+
+#+begin_src clojure
+(defn assign-variant
+  "Deterministic variant assignment using murmur3 hash.
+   Bucket = hash(experiment_id || bucketing_key) mod 100"
+  [experiment-id bucketing-key allocation]
+  (let [hash-input (str experiment-id ":" bucketing-key)
+        bucket     (mod (murmur3-32 hash-input) 100)]
+    (some (fn [[variant [lo hi]]]
+            (when (<= lo bucket hi) variant))
+          allocation)))
+#+end_src
+
+** POST /experiments
+
+Create a new experiment (admin only).
+
+*** Request
+
+#+begin_src http
+POST /experiments HTTP/1.1
+Host: metrics.petstore.internal
+Content-Type: application/json
+Authorization: Bearer <admin-token>
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+{
+  "experiment_id": "checkout_flow_v2",
+  "name": "Checkout Flow V2 Test",
+  "description": "Testing new streamlined checkout",
+  "feature_flag_id": "flag_checkout_v2",
+  "allocation": {
+    "control": [0, 49],
+    "treatment": [50, 99]
+  },
+  "metrics": {
+    "primary": "conversion_rate",
+    "secondary": ["cart_abandonment_rate", "checkout_time_seconds"]
+  },
+  "start_date": "2026-05-15T00:00:00Z",
+  "end_date": "2026-06-15T00:00:00Z"
+}
+#+end_src
+
+*** Response
+
+#+begin_src json
+{
+  "experiment_id": "checkout_flow_v2",
+  "status": "scheduled",
+  "created_at": "2026-05-09T14:35:00Z"
+}
+#+end_src
+
+** GET /experiments/{experiment_id}/results
+
+Get experiment results with statistical analysis.
+
+*** Request
+
+#+begin_src http
+GET /experiments/checkout_flow_v2/results HTTP/1.1
+Host: metrics.petstore.internal
+Authorization: Bearer <admin-token>
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+#+end_src
+
+*** Response
+
+#+begin_src json
+{
+  "experiment_id": "checkout_flow_v2",
+  "status": "running",
+  "started_at": "2026-05-15T00:00:00Z",
+  "current_date": "2026-05-20T00:00:00Z",
+  "variants": {
+    "control": {
+      "users": 4523,
+      "conversions": 412,
+      "conversion_rate": 0.0911
+    },
+    "treatment": {
+      "users": 4487,
+      "conversions": 478,
+      "conversion_rate": 0.1065
+    }
+  },
+  "analysis": {
+    "lift": 0.169,
+    "p_value": 0.023,
+    "confidence_interval": [0.02, 0.32],
+    "is_significant": true,
+    "recommended_action": "treatment variant shows 16.9% lift with p<0.05"
+  }
+}
+#+end_src
+
+* Analytics Query API
+
+** POST /query
+
+Execute analytics queries against ClickHouse. Supports both raw SQL (admin) and
+structured query builder (all users).
+
+*** Structured Query Request
+
+#+begin_src http
+POST /query HTTP/1.1
+Host: metrics.petstore.internal
+Content-Type: application/json
+Authorization: Bearer <token>
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+{
+  "type": "structured",
+  "table": "events_rollup_hourly",
+  "select": ["event_type", "count", "unique_users"],
+  "filters": [
+    {"field": "event_date", "op": ">=", "value": "2026-05-01"},
+    {"field": "event_date", "op": "<=", "value": "2026-05-09"},
+    {"field": "event_type", "op": "in", "value": ["impression", "click"]}
+  ],
+  "group_by": ["event_type", "event_date"],
+  "order_by": [{"field": "event_date", "direction": "asc"}],
+  "limit": 100
+}
+#+end_src
+
+*** Response
+
+#+begin_src json
+{
+  "columns": ["event_type", "event_date", "count", "unique_users"],
+  "rows": [
+    ["impression", "2026-05-01", 145230, 23456],
+    ["click", "2026-05-01", 12450, 8234],
+    ["impression", "2026-05-02", 152340, 24567],
+    ["click", "2026-05-02", 13210, 8901]
+  ],
+  "metadata": {
+    "row_count": 4,
+    "query_time_ms": 45,
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+  }
+}
+#+end_src
+
+*** Available Tables
+
+| Table                  | Description                          | Granularity |
+|------------------------+--------------------------------------+-------------|
+| events_raw             | Raw events (7 day retention)         | Event       |
+| events_rollup_hourly   | Hourly aggregates                    | Hour        |
+| events_rollup_daily    | Daily aggregates                     | Day         |
+| experiment_exposures   | Experiment variant exposures         | Event       |
+| conversion_funnels     | Funnel stage completion              | User/Step   |
+| user_journeys          | Session paths by trace_id            | Session     |
+
+** GET /query/journeys/{trace_id}
+
+Retrieve a user journey by trace_id. Shows all events in the trace.
+
+*** Request
+
+#+begin_src http
+GET /query/journeys/4bf92f3577b34da6a3ce929d0e0e4736 HTTP/1.1
+Host: metrics.petstore.internal
+Authorization: Bearer <token>
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+#+end_src
+
+*** Response
+
+#+begin_src json
+{
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "session_id": "sess_xyz789",
+  "user_id": "usr_456",
+  "started_at": "2026-05-09T14:28:00Z",
+  "ended_at": "2026-05-09T14:45:00Z",
+  "events": [
+    {
+      "span_id": "00f067aa0ba902b7",
+      "type": "impression",
+      "timestamp": "2026-05-09T14:30:00Z",
+      "properties": {"product_id": "prod_001"}
+    },
+    {
+      "span_id": "b7ad6b7169203331",
+      "type": "click",
+      "timestamp": "2026-05-09T14:30:05Z",
+      "properties": {"product_id": "prod_001"}
+    },
+    {
+      "span_id": "c8be7c8279314442",
+      "type": "add_to_cart",
+      "timestamp": "2026-05-09T14:32:00Z",
+      "properties": {"product_id": "prod_001", "quantity": 1}
+    },
+    {
+      "span_id": "d9cf8d9389425553",
+      "type": "purchase",
+      "timestamp": "2026-05-09T14:45:00Z",
+      "properties": {"order_id": "ord_123", "total": 49.99}
+    }
+  ],
+  "experiment_exposures": [
+    {
+      "experiment_id": "checkout_flow_v2",
+      "variant": "treatment",
+      "exposed_at": "2026-05-09T14:40:00Z"
+    }
+  ]
+}
+#+end_src
+
+* Real-Time Aggregation Patterns
+
+** Kafka Topics
+
+| Topic                     | Partitions | Retention | Description                    |
+|---------------------------+------------+-----------+--------------------------------|
+| metrics.events.raw        | 16         | 7d        | All raw events                 |
+| metrics.events.validated  | 16         | 7d        | Validated events               |
+| metrics.aggregations      | 8          | 1d        | Pre-aggregated rollups         |
+| metrics.experiments       | 4          | 30d       | Experiment exposures           |
+
+** Aggregator Processing
+
+The aggregator consumes from metrics.events.validated and produces:
+
+1. *Minute windows* - Tumbling windows, written to Redis for real-time dashboards
+2. *Hourly rollups* - Written to ClickHouse events_rollup_hourly
+3. *Daily rollups* - Triggered by end-of-day, written to events_rollup_daily
+
+#+begin_src mermaid :file aggregator-flow.png :eval never-export
+flowchart TB
+    Kafka[metrics.events.validated] --> Agg[Aggregator]
+
+    subgraph "Tumbling Windows"
+        Agg --> M1[1-min window]
+        Agg --> H1[1-hour window]
+    end
+
+    M1 -->|write| Redis[(Redis)]
+    H1 -->|write| CH[(ClickHouse)]
+
+    subgraph "Triggers"
+        EOD[End of Day] --> Daily[Daily Rollup]
+        Daily -->|write| CH
+    end
+#+end_src
+
+** Aggregation Schema
+
+#+begin_src sql
+-- ClickHouse table for hourly rollups
+CREATE TABLE events_rollup_hourly (
+    event_date Date,
+    event_hour DateTime,
+    event_type LowCardinality(String),
+    experiment_id Nullable(String),
+    variant Nullable(String),
+
+    -- Counts
+    count UInt64,
+    unique_sessions AggregateFunction(uniq, String),
+    unique_users AggregateFunction(uniq, String),
+
+    -- Product metrics
+    product_impressions UInt64,
+    product_clicks UInt64,
+    add_to_carts UInt64,
+    purchases UInt64,
+    revenue Decimal(18, 2)
+)
+ENGINE = SummingMergeTree()
+PARTITION BY event_date
+ORDER BY (event_date, event_hour, event_type, experiment_id, variant);
+#+end_src
+
+* Integration with Feature Flags
+
+The A/B Engine integrates with the Feature Flags service for variant evaluation:
+
+#+begin_src mermaid :file ab-flags-integration.png :eval never-export
+sequenceDiagram
+    participant Client as SPA
+    participant AB as A/B Engine
+    participant Flags as Feature Flags
+    participant Kafka as Kafka
+
+    Client->>+AB: GET /experiments/assign
+    Note over AB: Extract traceparent
+    AB->>+Flags: POST /evaluate (flag_id)
+    Note over Flags: Evaluate targeting rules
+    Flags-->>-AB: {enabled: true, variant: "treatment"}
+    AB->>AB: Compute bucket hash
+    AB->>Kafka: Publish exposure event
+    AB-->>-Client: {variant: "treatment"}
+#+end_src
+
+** Feature Flag Mapping
+
+Each experiment is backed by a feature flag. The flag controls:
+
+1. Whether the experiment is active
+2. User targeting rules (segments, percentages)
+3. Kill switch for immediate rollback
+
+| Experiment Field | Feature Flag Field |
+|------------------+--------------------|
+| experiment_id    | flag metadata      |
+| allocation       | rollout percentage |
+| targeting        | user segments      |
+| start_date       | schedule           |
+| end_date         | schedule           |
+
+* Error Handling
+
+** Error Codes
+
+| Code | HTTP Status | Description                    |
+|------+-------------+--------------------------------|
+| E001 | 400         | Invalid event schema           |
+| E002 | 400         | Missing traceparent            |
+| E003 | 400         | Invalid traceparent format     |
+| E004 | 429         | Rate limit exceeded            |
+| E005 | 404         | Experiment not found           |
+| E006 | 403         | Insufficient permissions       |
+| E007 | 500         | Internal aggregation error     |
+
+** Error Response Format
+
+#+begin_src json
+{
+  "error": {
+    "code": "E002",
+    "message": "Missing traceparent header",
+    "trace_id": null,
+    "details": {
+      "required_header": "traceparent",
+      "format": "00-{32 hex}-{16 hex}-{2 hex}"
+    }
+  }
+}
+#+end_src
+
+* Cross-References
+
+- C4 Component Diagram: [[file:../../../docs/architecture/c4/system-landscape.org::*Metrics Platform Components]]
+- Trace Wire Format: [[file:../../../spec/L1-wire.org]]
+- Feature Flags API: [[file:../../feature-flags/docs/api.org]]
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

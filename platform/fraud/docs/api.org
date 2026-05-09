@@ -1,0 +1,437 @@
+#+title: Fraud Service API
+#+author: trace-spine team
+#+date: 2026-05-09
+#+property: header-args :mkdirp t
+#+options: toc:3 num:t
+
+* Overview
+
+The Fraud Service provides real-time risk scoring for payment transactions. It
+aggregates multiple signals (rules, velocity, blocklists, ML) into a single risk
+score with sub-50ms p99 latency target.
+
+All endpoints accept and propagate =traceparent= headers per L1-wire.org.
+
+** Design Principles
+
+1. *Low latency first* — Scoring happens in the critical payment path
+2. *Fail open* — On service error, return neutral score (0.5) with error flag
+3. *Trace correlation* — Every decision links to the originating trace-id
+4. *Explainability* — Score response includes contributing signals
+
+* API Endpoints
+
+** POST /v1/score
+
+Score a transaction for fraud risk.
+
+*** Request
+
+#+begin_src http
+POST /v1/score HTTP/1.1
+Host: fraud.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+{
+  "transaction_id": "txn_abc123",
+  "user_id": "user_456",
+  "amount_cents": 9999,
+  "currency": "USD",
+  "ip_address": "203.0.113.42",
+  "email": "customer@example.com",
+  "device_fingerprint": "fp_xyz789",
+  "billing_address": {
+    "country": "US",
+    "postal_code": "94102"
+  },
+  "payment_method": {
+    "type": "card",
+    "bin": "424242",
+    "last_four": "4242"
+  },
+  "metadata": {
+    "channel": "web",
+    "session_duration_ms": 45000
+  }
+}
+#+end_src
+
+*** Response
+
+#+begin_src json
+{
+  "transaction_id": "txn_abc123",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "score": 0.23,
+  "decision": "allow",
+  "signals": {
+    "rule_engine": {
+      "score": 0.1,
+      "triggered_rules": []
+    },
+    "velocity": {
+      "score": 0.3,
+      "checks": {
+        "user_hourly": {"count": 2, "limit": 10},
+        "ip_hourly": {"count": 1, "limit": 5},
+        "device_daily": {"count": 3, "limit": 20}
+      }
+    },
+    "blocklist": {
+      "score": 0.0,
+      "matches": []
+    },
+    "ml": {
+      "score": 0.25,
+      "model_version": "fraud-v3.2.1",
+      "features_computed": true
+    }
+  },
+  "latency_ms": 12,
+  "evaluated_at": "2026-05-09T15:30:00.123Z"
+}
+#+end_src
+
+*** Decision Thresholds
+
+| Score Range | Decision | Action                        |
+|-------------+----------+-------------------------------|
+| 0.0 - 0.3   | allow    | Proceed with transaction      |
+| 0.3 - 0.7   | review   | Flag for manual review        |
+| 0.7 - 1.0   | block    | Reject transaction            |
+
+Thresholds are configurable per merchant via feature flags.
+
+** GET /v1/health
+
+Health check endpoint for load balancer probes.
+
+#+begin_src http
+GET /v1/health HTTP/1.1
+Host: fraud.internal
+#+end_src
+
+#+begin_src json
+{
+  "status": "healthy",
+  "redis": "connected",
+  "postgres": "connected",
+  "ml_model": "loaded"
+}
+#+end_src
+
+* Rule Engine Configuration
+
+** Rule Schema
+
+Rules are stored in PostgreSQL and cached in Redis.
+
+#+begin_src sql
+CREATE TABLE fraud_rules (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          VARCHAR(255) NOT NULL UNIQUE,
+    description   TEXT,
+    condition     JSONB NOT NULL,
+    score_delta   DECIMAL(4,3) NOT NULL CHECK (score_delta BETWEEN -1.0 AND 1.0),
+    enabled       BOOLEAN DEFAULT true,
+    priority      INTEGER DEFAULT 100,
+    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_fraud_rules_enabled ON fraud_rules(enabled) WHERE enabled = true;
+#+end_src
+
+** Condition DSL
+
+Rules use a JSON-based condition language.
+
+*** Operators
+
+| Operator | Description                | Example                                           |
+|----------+----------------------------+---------------------------------------------------|
+| =eq=     | Equality                   | ={"eq": [{"field": "currency"}, "USD"]}=          |
+| =gt=     | Greater than               | ={"gt": [{"field": "amount_cents"}, 50000]}=      |
+| =lt=     | Less than                  | ={"lt": [{"field": "amount_cents"}, 100]}=        |
+| =in=     | Set membership             | ={"in": [{"field": "country"}, ["RU", "NG"]]}=    |
+| =match=  | Regex match                | ={"match": [{"field": "email"}, ".*@temp\\..*"]}= |
+| =and=    | All conditions true        | ={"and": [...conditions]}=                        |
+| =or=     | Any condition true         | ={"or": [...conditions]}=                         |
+| =not=    | Negate condition           | ={"not": {...condition}}=                         |
+
+*** Example Rules
+
+*High-value transaction*:
+#+begin_src json
+{
+  "name": "high_value_transaction",
+  "description": "Flag transactions over $500",
+  "condition": {
+    "gt": [{"field": "amount_cents"}, 50000]
+  },
+  "score_delta": 0.15,
+  "priority": 50
+}
+#+end_src
+
+*Risky email domain*:
+#+begin_src json
+{
+  "name": "disposable_email",
+  "description": "Flag disposable email domains",
+  "condition": {
+    "match": [{"field": "email"}, ".*@(tempmail|guerrillamail|mailinator)\\..*"]
+  },
+  "score_delta": 0.25,
+  "priority": 80
+}
+#+end_src
+
+** Admin Endpoints
+
+*** GET /v1/rules
+
+List all rules.
+
+*** POST /v1/rules
+
+Create a new rule.
+
+*** PUT /v1/rules/:id
+
+Update an existing rule.
+
+*** DELETE /v1/rules/:id
+
+Disable a rule (soft delete).
+
+* Velocity Checking
+
+** Architecture
+
+Velocity checks use Redis sorted sets for efficient counting with TTL-based
+expiration.
+
+#+begin_src mermaid :file velocity-architecture.png :eval never-export
+flowchart LR
+    subgraph Redis["Redis Cluster"]
+        S1["velocity:user:{id}:hour"]
+        S2["velocity:ip:{ip}:hour"]
+        S3["velocity:device:{fp}:day"]
+        S4["velocity:card:{bin}:hour"]
+    end
+
+    Scorer["Risk Scorer"] --> |ZADD + ZCOUNT| Redis
+    Scorer --> |Pipeline| Redis
+#+end_src
+
+** Velocity Keys
+
+| Key Pattern                      | Window | Limit | Score Delta |
+|----------------------------------+--------+-------+-------------|
+| =velocity:user:{id}:hour=        | 1h     |    10 |        0.10 |
+| =velocity:ip:{ip}:hour=          | 1h     |     5 |        0.15 |
+| =velocity:device:{fp}:day=       | 24h    |    20 |        0.10 |
+| =velocity:card:{bin}:hour=       | 1h     |     3 |        0.20 |
+| =velocity:email:{hash}:day=      | 24h    |     5 |        0.15 |
+
+** Redis Operations
+
+Each velocity check is a two-command pipeline:
+
+#+begin_src clojure
+;; Record event and count in single round-trip
+(redis/pipeline
+  (redis/zadd key timestamp transaction-id)
+  (redis/zcount key (- now window-ms) now))
+#+end_src
+
+TTL is set to 2x window duration using =EXPIRE=.
+
+* Blocklist Management
+
+** Blocklist Types
+
+| Type        | Storage      | Check Latency | Update Frequency |
+|-------------+--------------+---------------+------------------|
+| IP          | Redis Set    | <1ms          | Real-time        |
+| Email       | Redis Set    | <1ms          | Real-time        |
+| Email Hash  | Redis Set    | <1ms          | Real-time        |
+| Device      | Redis Set    | <1ms          | Real-time        |
+| BIN         | Redis Set    | <1ms          | Daily            |
+| Country     | In-memory    | <0.1ms        | Deploy-time      |
+
+** Redis Key Structure
+
+#+begin_src text
+blocklist:ip           -> SET of blocked IPs
+blocklist:email        -> SET of blocked email hashes (SHA-256)
+blocklist:device       -> SET of blocked device fingerprints
+blocklist:bin          -> SET of blocked card BINs
+#+end_src
+
+** Admin Endpoints
+
+*** POST /v1/blocklist/:type
+
+Add entry to blocklist.
+
+#+begin_src http
+POST /v1/blocklist/ip HTTP/1.1
+Content-Type: application/json
+
+{
+  "value": "203.0.113.42",
+  "reason": "Confirmed fraud",
+  "expires_at": "2026-06-09T00:00:00Z"
+}
+#+end_src
+
+*** DELETE /v1/blocklist/:type/:value
+
+Remove entry from blocklist.
+
+*** GET /v1/blocklist/:type
+
+List blocklist entries (paginated).
+
+* ML Signal Integration
+
+** Feature Extraction
+
+The fraud service extracts features for ML scoring but does not run the model
+directly. Features are sent to a sidecar gRPC service.
+
+** Feature Vector
+
+#+begin_src clojure
+{:user_account_age_days       (days-since (:created_at user))
+ :user_previous_orders        (count (:orders user))
+ :user_fraud_rate             (/ (:fraud_count user) (max 1 (:order_count user)))
+ :transaction_amount_cents    amount
+ :transaction_amount_zscore   (zscore amount user-avg user-stddev)
+ :ip_country_match            (if (= ip-country billing-country) 1.0 0.0)
+ :email_domain_age_days       (domain-age email)
+ :device_seen_before          (if (known-device? device-fp user-id) 1.0 0.0)
+ :session_duration_seconds    (/ session-duration-ms 1000)
+ :hour_of_day                 (hour timestamp)
+ :day_of_week                 (day-of-week timestamp)}
+#+end_src
+
+** ML Service Contract
+
+#+begin_src protobuf
+service FraudML {
+  rpc Score(FeatureVector) returns (MLScore);
+}
+
+message FeatureVector {
+  map<string, double> features = 1;
+  string trace_id = 2;
+}
+
+message MLScore {
+  double score = 1;
+  string model_version = 2;
+  map<string, double> feature_importance = 3;
+}
+#+end_src
+
+** Fallback Behavior
+
+If ML service is unavailable (circuit open), return neutral score (0.5) for the
+ML signal. The rule engine and velocity checks continue independently.
+
+* Trace Correlation
+
+** Span Structure
+
+#+begin_src mermaid :file fraud-spans.png :eval never-export
+gantt
+    title Fraud Scoring Spans
+    dateFormat X
+    axisFormat %L ms
+
+    section Parent
+    fraud.score           :0, 15
+
+    section Children
+    fraud.rules.evaluate  :1, 3
+    fraud.velocity.check  :1, 4
+    fraud.blocklist.check :1, 2
+    fraud.ml.score        :5, 10
+    fraud.aggregate       :11, 14
+#+end_src
+
+** Span Attributes
+
+Each span includes:
+
+| Attribute                  | Type   | Description                     |
+|----------------------------+--------+---------------------------------|
+| =fraud.transaction_id=     | string | Transaction being scored        |
+| =fraud.user_id=            | string | User making transaction         |
+| =fraud.amount_cents=       | int    | Transaction amount              |
+| =fraud.score=              | float  | Final or component score        |
+| =fraud.decision=           | string | allow/review/block              |
+| =fraud.rule.name=          | string | Rule name (if triggered)        |
+| =fraud.velocity.key=       | string | Velocity check key              |
+| =fraud.blocklist.type=     | string | Blocklist type (if matched)     |
+
+** Error Handling
+
+On any error, the span is annotated with:
+
+#+begin_src clojure
+{:error true
+ :error.type "timeout"  ; or "redis_unavailable", "ml_circuit_open", etc.
+ :fraud.fallback_score 0.5}
+#+end_src
+
+* Configuration
+
+** Environment Variables
+
+| Variable                  | Default      | Description                    |
+|---------------------------+--------------+--------------------------------|
+| =FRAUD_REDIS_URL=         | (required)   | Redis connection URL           |
+| =FRAUD_POSTGRES_URL=      | (required)   | PostgreSQL connection URL      |
+| =FRAUD_ML_GRPC_ADDRESS=   | localhost:50051 | ML service gRPC address     |
+| =FRAUD_ML_TIMEOUT_MS=     | 20           | ML service call timeout        |
+| =FRAUD_ALLOW_THRESHOLD=   | 0.3          | Score below = allow            |
+| =FRAUD_BLOCK_THRESHOLD=   | 0.7          | Score above = block            |
+| =FRAUD_RULES_CACHE_TTL_S= | 60           | Rule cache TTL in seconds      |
+
+** .trace-spine.yaml
+
+#+begin_src yaml
+service: fraud
+version: 1
+trace_propagation:
+  inbound:
+    - http:traceparent
+  outbound:
+    - http:traceparent
+    - grpc:traceparent
+spans:
+  - name: fraud.score
+    type: server
+  - name: fraud.rules.evaluate
+    type: internal
+  - name: fraud.velocity.check
+    type: client
+    target: redis
+  - name: fraud.blocklist.check
+    type: client
+    target: redis
+  - name: fraud.ml.score
+    type: client
+    target: fraud-ml
+#+end_src
+
+* Cross-References
+
+- [[file:../../../spec/L1-wire.org][L1 Wire Format]] — traceparent format
+- [[file:../../../docs/architecture/c4/system-landscape.org][C4 Architecture]] — Fraud Service component diagram
+- [[file:code-diagram.org][Code Diagram]] — Implementation structure

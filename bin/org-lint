@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+#
+# bin/org-lint - Validate org-mode files
+#
+# Performs basic validation of org-mode files without requiring Emacs.
+# For comprehensive org-lint, use Emacs batch mode.
+#
+# Usage: bin/org-lint [--strict] [files...]
+#
+# Checks:
+# 1. Valid UTF-8 encoding
+# 2. Balanced source blocks (#+begin_src / #+end_src)
+# 3. Balanced property drawers (:PROPERTIES: / :END:)
+# 4. No trailing whitespace (warning only)
+# 5. Consistent heading structure
+#
+
+set -euo pipefail
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+STRICT=0
+FAILURES=0
+WARNINGS=0
+CHECKED=0
+
+log_ok() { echo -e "${GREEN}OK${NC} $1"; }
+log_warn() { echo -e "${YELLOW}WARN${NC} $1"; ((WARNINGS++)); }
+log_fail() { echo -e "${RED}FAIL${NC} $1"; ((FAILURES++)); }
+
+usage() {
+  echo "Usage: $(basename "$0") [--strict] [files...]"
+  echo ""
+  echo "Options:"
+  echo "  --strict    Treat warnings as errors"
+  echo "  files       Specific org files to check (default: all *.org in repo)"
+  exit 0
+}
+
+# Parse arguments
+FILES=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --strict)
+      STRICT=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      ;;
+    *)
+      FILES+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# Find org files if none specified
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  mapfile -t FILES < <(find . -name "*.org" -type f ! -path "./.git/*" 2>/dev/null)
+fi
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo "No org files found"
+  exit 0
+fi
+
+echo "=== Org-mode Validation ==="
+echo "Checking ${#FILES[@]} file(s)..."
+echo ""
+
+for file in "${FILES[@]}"; do
+  [[ -f "$file" ]] || continue
+  ((CHECKED++))
+
+  file_errors=0
+  file_warnings=0
+
+  # Check 1: Valid UTF-8
+  if ! file "$file" | grep -q "UTF-8\|ASCII\|text"; then
+    log_fail "$file: Not valid UTF-8/ASCII text"
+    ((file_errors++))
+    continue
+  fi
+
+  # Check 2: Balanced source blocks
+  begin_count=$(grep -ci '^[[:space:]]*#+begin_' "$file" 2>/dev/null || echo 0)
+  end_count=$(grep -ci '^[[:space:]]*#+end_' "$file" 2>/dev/null || echo 0)
+  if [[ "$begin_count" != "$end_count" ]]; then
+    log_fail "$file: Unbalanced blocks (begin: $begin_count, end: $end_count)"
+    ((file_errors++))
+  fi
+
+  # Check 3: Balanced property drawers
+  props_start=$(grep -c '^[[:space:]]*:PROPERTIES:' "$file" 2>/dev/null || echo 0)
+  props_end=$(grep -c '^[[:space:]]*:END:' "$file" 2>/dev/null || echo 0)
+  # Note: :END: is used for both PROPERTIES and other drawers, so we just check they exist
+  if [[ "$props_start" -gt 0 ]] && [[ "$props_end" -lt "$props_start" ]]; then
+    log_fail "$file: Unclosed property drawers"
+    ((file_errors++))
+  fi
+
+  # Check 4: Trailing whitespace (warning only)
+  if grep -qE '[[:space:]]$' "$file" 2>/dev/null; then
+    log_warn "$file: Has trailing whitespace"
+    ((file_warnings++))
+  fi
+
+  # Check 5: Mixed tabs and spaces in indentation (warning only)
+  if grep -qP '^\t+ ' "$file" 2>/dev/null || grep -qP '^ +\t' "$file" 2>/dev/null; then
+    log_warn "$file: Mixed tabs and spaces in indentation"
+    ((file_warnings++))
+  fi
+
+  # Check 6: Empty file
+  if [[ ! -s "$file" ]]; then
+    log_warn "$file: Empty file"
+    ((file_warnings++))
+  fi
+
+  # Check 7: Suspicious patterns
+  # Unclosed links
+  if grep -qP '\[\[[^\]]*$' "$file" 2>/dev/null; then
+    log_warn "$file: Possible unclosed link"
+    ((file_warnings++))
+  fi
+
+  # Report success if no errors
+  if [[ $file_errors -eq 0 ]] && [[ $file_warnings -eq 0 ]]; then
+    log_ok "$file"
+  elif [[ $file_errors -eq 0 ]]; then
+    echo -e "${GREEN}OK${NC} $file (${file_warnings} warning(s))"
+  fi
+done
+
+echo ""
+echo "=== Summary ==="
+echo "Checked: $CHECKED file(s)"
+echo "Failures: $FAILURES"
+echo "Warnings: $WARNINGS"
+
+if [[ $FAILURES -gt 0 ]]; then
+  exit 1
+elif [[ $STRICT -eq 1 ]] && [[ $WARNINGS -gt 0 ]]; then
+  echo "Strict mode: treating warnings as errors"
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,156 @@
+# Dedicated Linting Workflow for trace-spine
+# Runs linting checks independently for faster feedback
+#
+# This workflow runs on all pushes and PRs to provide quick feedback
+# on code quality without waiting for the full test suite.
+
+name: Lint
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.clj"
+      - "**.cljc"
+      - "**.cljs"
+      - "**.edn"
+      - "**.org"
+      - ".github/workflows/lint.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "**.clj"
+      - "**.cljc"
+      - "**.cljs"
+      - "**.edn"
+      - "**.org"
+      - ".github/workflows/lint.yml"
+
+jobs:
+  clj-kondo:
+    name: clj-kondo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup clj-kondo
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          clj-kondo: "latest"
+
+      - name: Lint lib/clj
+        run: |
+          if [[ -d lib/clj/src ]]; then
+            clj-kondo --lint lib/clj/src
+          fi
+
+      - name: Lint platform/api
+        run: |
+          if [[ -d platform/api/src ]]; then
+            clj-kondo --lint platform/api/src
+          fi
+
+      - name: Lint platform/wms
+        run: |
+          if [[ -d platform/wms/src ]]; then
+            clj-kondo --lint platform/wms/src
+          fi
+
+      - name: Lint platform/payments
+        run: |
+          if [[ -d platform/payments/src ]]; then
+            clj-kondo --lint platform/payments/src
+          fi
+
+      - name: Lint platform/wallet
+        run: |
+          if [[ -d platform/wallet/src ]]; then
+            clj-kondo --lint platform/wallet/src
+          fi
+
+      - name: Lint platform/fraud
+        run: |
+          if [[ -d platform/fraud/src ]]; then
+            clj-kondo --lint platform/fraud/src
+          fi
+
+      - name: Lint platform/metrics
+        run: |
+          if [[ -d platform/metrics/src ]]; then
+            clj-kondo --lint platform/metrics/src
+          fi
+
+      - name: Lint platform/feature-flags
+        run: |
+          if [[ -d platform/feature-flags/src ]]; then
+            clj-kondo --lint platform/feature-flags/src
+          fi
+
+  org-lint:
+    name: org-lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate org-mode files
+        run: |
+          chmod +x bin/org-lint
+          bin/org-lint
+
+  deps-edn:
+    name: deps.edn validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: "1.12.0"
+
+      - name: Validate deps.edn syntax
+        run: |
+          for f in $(find . -name "deps.edn" -type f); do
+            echo "Validating $f"
+            clojure -Sdeps "{:deps {}}" -e "(read-string (slurp \"$f\"))" || exit 1
+          done
+          echo "All deps.edn files are valid"
+
+  emacs-org-lint:
+    name: Emacs org-lint (optional)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Emacs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y emacs-nox
+
+      - name: Run Emacs org-lint
+        run: |
+          # Run org-lint on all org files
+          # This provides more comprehensive checking than the shell script
+          find . -name "*.org" -type f ! -path "./.git/*" | while read -r file; do
+            echo "Checking: $file"
+            emacs --batch \
+              --eval "(require 'org)" \
+              --eval "(require 'org-lint)" \
+              --visit "$file" \
+              --eval "(let ((warnings (org-lint))) \
+                       (when warnings \
+                         (dolist (w warnings) \
+                           (message \"Line %d: %s\" (car w) (nth 2 w)))))" \
+              2>&1 || true
+          done

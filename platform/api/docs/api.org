@@ -1,0 +1,693 @@
+#+title: API Gateway — Endpoint Specification
+#+author: trace-spine team
+#+date: 2026-05-09
+#+property: header-args :mkdirp t
+#+options: toc:3 num:t
+
+* Overview
+
+This document specifies the API Gateway for the Petstore Commerce Platform.
+The gateway serves as the unified entry point for all client applications,
+providing REST and GraphQL endpoints with integrated trace-spine middleware.
+
+** Design Principles
+
+1. **Trace-first**: Every request carries W3C traceparent, propagated to all downstream services
+2. **Security-first**: JWT authentication with feature-flag-based access control
+3. **Rate-limited**: Per-user and per-IP rate limiting via Redis
+4. **Dual-protocol**: REST for CRUD operations, GraphQL for flexible queries
+
+** Base URLs
+
+| Environment | URL                                |
+|-------------+------------------------------------|
+| Production  | https://api.petstore.example.com   |
+| Staging     | https://api.staging.petstore.example.com |
+| Development | http://localhost:3000              |
+
+* Authentication
+
+** JWT Token Format
+
+#+begin_src json
+{
+  "iss": "petstore-auth",
+  "sub": "user-uuid",
+  "aud": "petstore-api",
+  "exp": 1715270400,
+  "iat": 1715266800,
+  "scope": ["read:catalog", "write:cart", "write:orders"],
+  "roles": ["customer"],
+  "tenant_id": "tenant-uuid"
+}
+#+end_src
+
+** Authentication Flow
+
+#+begin_src mermaid :file auth-flow.png :eval never-export
+sequenceDiagram
+    participant Client
+    participant API as API Gateway
+    participant Auth as Auth Middleware
+    participant Flags as Feature Flags
+    participant Service as Backend Service
+
+    Client->>+API: Request (Authorization: Bearer <token>)
+    API->>+Auth: Validate JWT
+    Auth->>Auth: Verify signature, expiry
+    Auth-->>-API: {:user-id "..." :scopes [...]}
+    API->>+Flags: Check feature access
+    Flags-->>-API: {:allowed true}
+    API->>+Service: Forward (traceparent, user context)
+    Service-->>-API: Response
+    API-->>-Client: Response
+#+end_src
+
+** Endpoints
+
+*** POST /auth/login
+
+Authenticate user and obtain JWT token.
+
+*Request:*
+#+begin_src json
+{
+  "email": "user@example.com",
+  "password": "secret"
+}
+#+end_src
+
+*Response (200):*
+#+begin_src json
+{
+  "access_token": "eyJ...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "refresh_token": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..."
+}
+#+end_src
+
+*** POST /auth/refresh
+
+Refresh an expired access token.
+
+*Request:*
+#+begin_src json
+{
+  "refresh_token": "dGhpcyBpcyBhIHJlZnJlc2ggdG9rZW4..."
+}
+#+end_src
+
+*** POST /auth/logout
+
+Invalidate refresh token.
+
+* Rate Limiting
+
+** Configuration
+
+| Tier       | Requests/min | Requests/hour | Burst |
+|------------+--------------+---------------+-------|
+| Anonymous  |           30 |           500 |    10 |
+| Registered |          120 |          5000 |    50 |
+| Premium    |          600 |         25000 |   200 |
+| Internal   |        10000 |           N/A |  1000 |
+
+** Headers
+
+Every response includes rate limit headers:
+
+#+begin_src text
+X-RateLimit-Limit: 120
+X-RateLimit-Remaining: 118
+X-RateLimit-Reset: 1715266860
+X-RateLimit-Policy: "120;w=60"
+#+end_src
+
+** Rate Limit Exceeded Response (429)
+
+#+begin_src json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests",
+  "retry_after": 45
+}
+#+end_src
+
+* REST Endpoints
+
+** Catalog Service
+
+*** GET /api/v1/products
+
+List products with pagination and filtering.
+
+*Query Parameters:*
+| Parameter  | Type    | Default | Description              |
+|------------+---------+---------+--------------------------|
+| page       | integer |       1 | Page number              |
+| limit      | integer |      20 | Items per page (max 100) |
+| category   | string  |         | Filter by category slug  |
+| q          | string  |         | Search query             |
+| sort       | string  | popular | Sort: popular, price, new |
+| min_price  | decimal |         | Minimum price filter     |
+| max_price  | decimal |         | Maximum price filter     |
+
+*Response (200):*
+#+begin_src json
+{
+  "data": [
+    {
+      "id": "prod-uuid",
+      "name": "Premium Cat Food",
+      "slug": "premium-cat-food",
+      "description": "...",
+      "price": {"amount": 29.99, "currency": "USD"},
+      "category": {"id": "cat-uuid", "name": "Cat Food"},
+      "images": [{"url": "...", "alt": "..."}],
+      "inventory": {"available": true, "quantity": 150},
+      "created_at": "2026-05-01T10:00:00Z"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "total": 1234,
+    "total_pages": 62
+  },
+  "meta": {
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+  }
+}
+#+end_src
+
+*** GET /api/v1/products/:id
+
+Get product details.
+
+*Response (200):*
+#+begin_src json
+{
+  "data": {
+    "id": "prod-uuid",
+    "name": "Premium Cat Food",
+    "slug": "premium-cat-food",
+    "description": "High-quality nutrition for cats",
+    "long_description": "...",
+    "price": {"amount": 29.99, "currency": "USD"},
+    "compare_at_price": {"amount": 34.99, "currency": "USD"},
+    "category": {"id": "cat-uuid", "name": "Cat Food", "path": ["Pets", "Cats", "Food"]},
+    "images": [
+      {"url": "...", "alt": "...", "position": 1}
+    ],
+    "variants": [
+      {"id": "var-uuid", "name": "5lb Bag", "price": {"amount": 29.99, "currency": "USD"}}
+    ],
+    "inventory": {"available": true, "quantity": 150},
+    "attributes": {"brand": "PetCo", "weight": "5lb"},
+    "reviews": {"average": 4.5, "count": 127},
+    "created_at": "2026-05-01T10:00:00Z",
+    "updated_at": "2026-05-08T15:30:00Z"
+  },
+  "meta": {
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+  }
+}
+#+end_src
+
+*** GET /api/v1/categories
+
+List all categories.
+
+*** GET /api/v1/categories/:id/products
+
+List products in a category.
+
+** Cart Service
+
+*** GET /api/v1/cart
+
+Get current user's cart.
+
+*Response (200):*
+#+begin_src json
+{
+  "data": {
+    "id": "cart-uuid",
+    "items": [
+      {
+        "id": "item-uuid",
+        "product": {"id": "prod-uuid", "name": "Premium Cat Food"},
+        "variant": {"id": "var-uuid", "name": "5lb Bag"},
+        "quantity": 2,
+        "unit_price": {"amount": 29.99, "currency": "USD"},
+        "line_total": {"amount": 59.98, "currency": "USD"}
+      }
+    ],
+    "subtotal": {"amount": 59.98, "currency": "USD"},
+    "estimated_tax": {"amount": 5.40, "currency": "USD"},
+    "estimated_total": {"amount": 65.38, "currency": "USD"},
+    "item_count": 2
+  },
+  "meta": {
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+  }
+}
+#+end_src
+
+*** POST /api/v1/cart/items
+
+Add item to cart.
+
+*Request:*
+#+begin_src json
+{
+  "product_id": "prod-uuid",
+  "variant_id": "var-uuid",
+  "quantity": 1
+}
+#+end_src
+
+*** PATCH /api/v1/cart/items/:id
+
+Update cart item quantity.
+
+*Request:*
+#+begin_src json
+{
+  "quantity": 3
+}
+#+end_src
+
+*** DELETE /api/v1/cart/items/:id
+
+Remove item from cart.
+
+*** DELETE /api/v1/cart
+
+Clear entire cart.
+
+** Order Service
+
+*** POST /api/v1/checkout
+
+Create order from cart.
+
+*Request:*
+#+begin_src json
+{
+  "shipping_address": {
+    "name": "John Doe",
+    "street1": "123 Main St",
+    "street2": "Apt 4",
+    "city": "San Francisco",
+    "state": "CA",
+    "postal_code": "94105",
+    "country": "US"
+  },
+  "billing_address": "same_as_shipping",
+  "payment_method": {
+    "type": "card",
+    "token": "tok_xxx"
+  },
+  "shipping_method": "standard",
+  "promo_code": "SAVE10"
+}
+#+end_src
+
+*Response (201):*
+#+begin_src json
+{
+  "data": {
+    "id": "order-uuid",
+    "number": "ORD-20260509-001234",
+    "status": "confirmed",
+    "items": [...],
+    "subtotal": {"amount": 59.98, "currency": "USD"},
+    "shipping": {"amount": 5.99, "currency": "USD"},
+    "tax": {"amount": 5.40, "currency": "USD"},
+    "discount": {"amount": 5.99, "currency": "USD"},
+    "total": {"amount": 65.38, "currency": "USD"},
+    "created_at": "2026-05-09T12:00:00Z"
+  },
+  "meta": {
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+  }
+}
+#+end_src
+
+*** GET /api/v1/orders
+
+List user's orders.
+
+*** GET /api/v1/orders/:id
+
+Get order details.
+
+*** POST /api/v1/orders/:id/cancel
+
+Cancel an order (if cancellable).
+
+** Wallet Service
+
+*** GET /api/v1/wallet
+
+Get user's wallet balance.
+
+*Response (200):*
+#+begin_src json
+{
+  "data": {
+    "store_credit": {"amount": 25.00, "currency": "USD"},
+    "gift_cards": [
+      {"code": "GC-XXXX-1234", "balance": {"amount": 50.00, "currency": "USD"}}
+    ],
+    "loyalty_points": 1250,
+    "loyalty_points_value": {"amount": 12.50, "currency": "USD"}
+  },
+  "meta": {
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+  }
+}
+#+end_src
+
+*** POST /api/v1/wallet/gift-cards
+
+Add a gift card.
+
+*Request:*
+#+begin_src json
+{
+  "code": "ABCD-EFGH-IJKL-MNOP"
+}
+#+end_src
+
+* GraphQL Endpoint
+
+** Endpoint
+
+~POST /api/graphql~
+
+** Schema
+
+#+begin_src graphql
+type Query {
+  # Catalog
+  products(
+    page: Int = 1
+    limit: Int = 20
+    category: ID
+    search: String
+    sort: ProductSort = POPULAR
+    priceRange: PriceRangeInput
+  ): ProductConnection!
+
+  product(id: ID, slug: String): Product
+  categories: [Category!]!
+  category(id: ID, slug: String): Category
+
+  # Cart
+  cart: Cart
+
+  # Orders
+  orders(page: Int = 1, limit: Int = 20): OrderConnection!
+  order(id: ID!): Order
+
+  # Wallet
+  wallet: Wallet
+
+  # User
+  me: User
+}
+
+type Mutation {
+  # Cart
+  addToCart(input: AddToCartInput!): Cart!
+  updateCartItem(id: ID!, quantity: Int!): Cart!
+  removeFromCart(id: ID!): Cart!
+  clearCart: Cart!
+
+  # Checkout
+  checkout(input: CheckoutInput!): Order!
+
+  # Orders
+  cancelOrder(id: ID!): Order!
+
+  # Wallet
+  addGiftCard(code: String!): Wallet!
+}
+
+type Subscription {
+  orderStatusChanged(orderId: ID!): Order!
+}
+
+type Product {
+  id: ID!
+  name: String!
+  slug: String!
+  description: String
+  price: Money!
+  compareAtPrice: Money
+  category: Category!
+  images: [Image!]!
+  variants: [ProductVariant!]!
+  inventory: Inventory!
+  attributes: JSON
+  reviews: ReviewSummary!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type ProductConnection {
+  edges: [ProductEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type ProductEdge {
+  node: Product!
+  cursor: String!
+}
+
+type Category {
+  id: ID!
+  name: String!
+  slug: String!
+  description: String
+  parent: Category
+  children: [Category!]!
+  products(page: Int, limit: Int): ProductConnection!
+}
+
+type Cart {
+  id: ID!
+  items: [CartItem!]!
+  subtotal: Money!
+  estimatedTax: Money!
+  estimatedTotal: Money!
+  itemCount: Int!
+}
+
+type CartItem {
+  id: ID!
+  product: Product!
+  variant: ProductVariant
+  quantity: Int!
+  unitPrice: Money!
+  lineTotal: Money!
+}
+
+type Order {
+  id: ID!
+  number: String!
+  status: OrderStatus!
+  items: [OrderItem!]!
+  shippingAddress: Address!
+  billingAddress: Address!
+  subtotal: Money!
+  shipping: Money!
+  tax: Money!
+  discount: Money
+  total: Money!
+  payments: [Payment!]!
+  shipments: [Shipment!]!
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type Money {
+  amount: Float!
+  currency: String!
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum ProductSort {
+  POPULAR
+  PRICE_ASC
+  PRICE_DESC
+  NEWEST
+  NAME_ASC
+  NAME_DESC
+}
+
+input AddToCartInput {
+  productId: ID!
+  variantId: ID
+  quantity: Int!
+}
+
+input CheckoutInput {
+  shippingAddress: AddressInput!
+  billingAddress: AddressInput
+  sameAsBilling: Boolean = false
+  paymentMethod: PaymentMethodInput!
+  shippingMethod: String!
+  promoCode: String
+}
+
+scalar DateTime
+scalar JSON
+#+end_src
+
+** Example Query
+
+#+begin_src graphql
+query GetCartWithProducts {
+  cart {
+    id
+    itemCount
+    items {
+      id
+      quantity
+      lineTotal { amount currency }
+      product {
+        id
+        name
+        images { url alt }
+      }
+    }
+    subtotal { amount currency }
+    estimatedTotal { amount currency }
+  }
+}
+#+end_src
+
+** Extensions
+
+All GraphQL responses include trace metadata in extensions:
+
+#+begin_src json
+{
+  "data": {...},
+  "extensions": {
+    "tracing": {
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_id": "00f067aa0ba902b7",
+      "duration_ms": 45
+    }
+  }
+}
+#+end_src
+
+* Trace Propagation
+
+** Request Headers
+
+Clients SHOULD include traceparent header:
+
+#+begin_src text
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+tracestate: petstore=tenant123
+#+end_src
+
+** Behavior
+
+1. If traceparent present: Extract and continue trace, create child span
+2. If traceparent absent on ingress: Generate new trace_id and span_id
+3. If traceparent absent on internal call: Reject with 400 (programmer error)
+
+** Response Headers
+
+All responses include:
+
+#+begin_src text
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-a1b2c3d4e5f6a7b8-01
+X-Trace-Id: 4bf92f3577b34da6a3ce929d0e0e4736
+#+end_src
+
+** Error Response with Trace
+
+#+begin_src json
+{
+  "error": "not_found",
+  "message": "Product not found",
+  "meta": {
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "request_id": "req-uuid"
+  }
+}
+#+end_src
+
+* Error Codes
+
+| Code | HTTP Status | Description                    |
+|------+-------------+--------------------------------|
+| 400  | Bad Request | Invalid request format         |
+| 401  | Unauthorized | Missing or invalid token      |
+| 403  | Forbidden   | Insufficient permissions       |
+| 404  | Not Found   | Resource not found             |
+| 409  | Conflict    | Resource conflict (e.g., cart) |
+| 422  | Unprocessable | Validation failed            |
+| 429  | Too Many Requests | Rate limit exceeded      |
+| 500  | Internal Error | Server error                |
+| 502  | Bad Gateway | Downstream service error       |
+| 503  | Unavailable | Service temporarily down       |
+
+* Health Endpoints
+
+*** GET /health
+
+Basic health check (no auth required).
+
+*Response (200):*
+#+begin_src json
+{
+  "status": "healthy",
+  "timestamp": "2026-05-09T12:00:00Z"
+}
+#+end_src
+
+*** GET /health/ready
+
+Readiness probe (checks downstream dependencies).
+
+*** GET /health/live
+
+Liveness probe (basic process health).
+
+* Metrics Endpoints
+
+*** GET /metrics
+
+Prometheus-format metrics (internal only).
+
+* Cross-References
+
+- [[file:../../../docs/architecture/c4/system-landscape.org][C4 System Landscape]]
+- [[file:../../../spec/L1-wire.org][L1 Wire Format]]
+- [[file:../../../spec/L1-contracts.org][L1 Function Contracts]]
+
+* Local Variables                                                   :noexport:
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

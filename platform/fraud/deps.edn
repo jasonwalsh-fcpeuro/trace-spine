@@ -1,0 +1,82 @@
+{:paths ["src" "resources"]
+
+ :deps
+ {;; Clojure core
+  org.clojure/clojure                   {:mvn/version "1.12.0"}
+  org.clojure/core.async                {:mvn/version "1.6.681"}
+
+  ;; HTTP server
+  ring/ring-core                        {:mvn/version "1.12.1"}
+  ring/ring-jetty-adapter               {:mvn/version "1.12.1"}
+  ring/ring-json                        {:mvn/version "0.5.1"}
+  metosin/reitit                        {:mvn/version "0.7.2"}
+  metosin/muuntaja                      {:mvn/version "0.6.10"}
+
+  ;; trace-spine integration
+  io.opentelemetry/opentelemetry-api    {:mvn/version "1.40.0"}
+  io.opentelemetry/opentelemetry-sdk    {:mvn/version "1.40.0"}
+
+  ;; Redis
+  com.taoensso/carmine                  {:mvn/version "3.4.1"}
+
+  ;; PostgreSQL
+  com.github.seancorfield/next.jdbc     {:mvn/version "1.3.939"}
+  org.postgresql/postgresql             {:mvn/version "42.7.3"}
+  com.zaxxer/HikariCP                   {:mvn/version "5.1.0"}
+
+  ;; JSON handling
+  metosin/jsonista                      {:mvn/version "0.3.8"}
+  cheshire/cheshire                     {:mvn/version "5.13.0"}
+
+  ;; gRPC for ML service
+  io.grpc/grpc-api                      {:mvn/version "1.65.1"}
+  io.grpc/grpc-stub                     {:mvn/version "1.65.1"}
+  io.grpc/grpc-netty-shaded             {:mvn/version "1.65.1"}
+  io.grpc/grpc-protobuf                 {:mvn/version "1.65.1"}
+
+  ;; Resilience
+  io.github.resilience4j/resilience4j-circuitbreaker {:mvn/version "2.2.0"}
+  io.github.resilience4j/resilience4j-retry          {:mvn/version "2.2.0"}
+
+  ;; Logging
+  org.clojure/tools.logging             {:mvn/version "1.3.0"}
+  ch.qos.logback/logback-classic        {:mvn/version "1.5.6"}
+
+  ;; Config
+  aero/aero                             {:mvn/version "1.1.6"}
+
+  ;; Monitoring
+  io.prometheus/simpleclient            {:mvn/version "0.16.0"}
+  io.prometheus/simpleclient_hotspot    {:mvn/version "0.16.0"}
+  io.prometheus/simpleclient_httpserver {:mvn/version "0.16.0"}}
+
+ :aliases
+ {:dev
+  {:extra-paths ["dev" "test"]
+   :extra-deps
+   {nrepl/nrepl                    {:mvn/version "1.1.1"}
+    cider/cider-nrepl              {:mvn/version "0.47.1"}
+    org.clojure/tools.namespace    {:mvn/version "1.5.0"}}}
+
+  :test
+  {:extra-paths ["test"]
+   :extra-deps
+   {lambdaisland/kaocha            {:mvn/version "1.91.1392"}
+    nubank/matcher-combinators     {:mvn/version "3.9.1"}
+    org.testcontainers/testcontainers {:mvn/version "1.19.8"}
+    org.testcontainers/postgresql  {:mvn/version "1.19.8"}
+    com.github.fpinschmidt/testcontainers-redis {:mvn/version "1.6.4"}}}
+
+  :run
+  {:main-opts ["-m" "fraud.core"]}
+
+  :uberjar
+  {:extra-deps
+   {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
+   :main-opts ["-m" "hf.depstar.uberjar" "target/fraud.jar"
+               "-C" "-m" "fraud.core"]}
+
+  :outdated
+  {:extra-deps
+   {com.github.liquidz/antq {:mvn/version "RELEASE"}}
+   :main-opts ["-m" "antq.core"]}}}

@@ -1,0 +1,81 @@
+{:paths ["src" "resources"]
+
+ :deps
+ {;; Core
+  org.clojure/clojure          {:mvn/version "1.12.0"}
+  org.clojure/core.async       {:mvn/version "1.6.681"}
+
+  ;; HTTP / Ring
+  ring/ring-core               {:mvn/version "1.12.1"}
+  ring/ring-jetty-adapter      {:mvn/version "1.12.1"}
+  ring/ring-json               {:mvn/version "0.5.1"}
+  metosin/reitit-ring          {:mvn/version "0.7.0"}
+  metosin/reitit-middleware    {:mvn/version "0.7.0"}
+
+  ;; JSON
+  metosin/jsonista             {:mvn/version "0.3.8"}
+
+  ;; Database
+  com.github.seancorfield/next.jdbc {:mvn/version "1.3.909"}
+  org.postgresql/postgresql    {:mvn/version "42.7.3"}
+  com.github.seancorfield/honeysql {:mvn/version "2.6.1126"}
+  com.zaxxer/HikariCP          {:mvn/version "5.1.0"}
+
+  ;; Redis
+  com.taoensso/carmine         {:mvn/version "3.3.2"}
+
+  ;; Tracing / trace-spine
+  ;; io.opentelemetry/opentelemetry-api {:mvn/version "1.37.0"}
+  ;; trace-spine/core {:local/root "../../lib/clj"}
+
+  ;; Hashing (for consistent rollout buckets)
+  org.clojure/data.finger-tree {:mvn/version "0.0.3"}
+
+  ;; Validation
+  metosin/malli                {:mvn/version "0.15.0"}
+
+  ;; Logging
+  com.taoensso/timbre          {:mvn/version "6.5.0"}
+
+  ;; Config
+  aero/aero                    {:mvn/version "1.1.6"}
+
+  ;; Time
+  clojure.java-time/clojure.java-time {:mvn/version "1.4.2"}}
+
+ :aliases
+ {:dev
+  {:extra-paths ["dev" "test"]
+   :extra-deps
+   {nrepl/nrepl               {:mvn/version "1.1.1"}
+    cider/cider-nrepl         {:mvn/version "0.47.1"}
+    lambdaisland/kaocha       {:mvn/version "1.88.1376"}
+    nubank/matcher-combinators {:mvn/version "3.9.1"}}}
+
+  :test
+  {:extra-paths ["test"]
+   :extra-deps
+   {lambdaisland/kaocha       {:mvn/version "1.88.1376"}
+    nubank/matcher-combinators {:mvn/version "3.9.1"}
+    ring/ring-mock             {:mvn/version "0.4.0"}}
+   :main-opts ["-m" "kaocha.runner"]}
+
+  :run
+  {:main-opts ["-m" "flags.main"]}
+
+  :uberjar
+  {:extra-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
+   :exec-fn    hf.depstar/uberjar
+   :exec-args  {:jar "target/feature-flags.jar"
+                :aot true
+                :main-class flags.main}}
+
+  :outdated
+  {:extra-deps {com.github.liquidz/antq {:mvn/version "2.8.1185"}}
+   :main-opts ["-m" "antq.core"]}
+
+  :repl
+  {:extra-deps {nrepl/nrepl       {:mvn/version "1.1.1"}
+                cider/cider-nrepl {:mvn/version "0.47.1"}}
+   :main-opts ["-m" "nrepl.cmdline"
+               "--middleware" "[cider.nrepl/cider-middleware]"]}}}

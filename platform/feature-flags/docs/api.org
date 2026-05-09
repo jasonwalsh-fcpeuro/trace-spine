@@ -1,0 +1,759 @@
+#+title: Feature Flags Service — API Specification
+#+author: trace-spine team
+#+date: 2026-05-09
+#+property: header-args :mkdirp t
+#+options: toc:3 num:t
+
+* Overview
+
+The Feature Flags Service provides flag evaluation, targeting rules, and percentage
+rollouts for the Petstore Commerce Platform. All evaluations carry traceparent context
+for A/B correlation — enabling causally-linked experiment analysis.
+
+** Key Design Principles
+
+1. *Trace-aware evaluation* — every flag decision includes trace-id for downstream
+   correlation with metrics, conversions, and user behavior
+2. *Redis-cached* — hot path reads from Redis; writes sync to PostgreSQL
+3. *Deterministic rollouts* — percentage rollouts use consistent hashing on user-id +
+   flag-key for stable assignment
+4. *LaunchDarkly optional* — can sync flags bidirectionally or run standalone
+
+** Components (from C4)
+
+| Component       | Responsibility                          |
+|-----------------+-----------------------------------------|
+| Flag Evaluator  | Evaluates flags for given context       |
+| Targeting Engine| User/segment targeting rules            |
+| Rollout Manager | Percentage rollouts, schedules          |
+| External Sync   | Syncs with LaunchDarkly if configured   |
+| Admin API       | Flag CRUD operations                    |
+
+* Data Model
+
+** Flag
+
+#+begin_src clojure :eval no
+{:flag/key         "checkout-v2"              ; unique identifier
+ :flag/name        "Checkout V2 Redesign"     ; human-readable name
+ :flag/description "New checkout flow with express payment"
+ :flag/kind        :boolean                   ; :boolean | :string | :number | :json
+ :flag/default     false                      ; value when no rules match
+ :flag/enabled     true                       ; master switch
+ :flag/rules       [<targeting-rule>...]      ; evaluated in order
+ :flag/rollout     <rollout-config>           ; percentage rollout (optional)
+ :flag/created-at  #inst "2026-05-09T..."
+ :flag/updated-at  #inst "2026-05-09T..."
+ :flag/archived    false}
+#+end_src
+
+** Targeting Rule
+
+#+begin_src clojure :eval no
+{:rule/id          "rule-001"
+ :rule/description "Beta users get new checkout"
+ :rule/clauses     [{:attribute "user.tier"
+                     :op        :in
+                     :values    ["beta" "alpha"]}
+                    {:attribute "user.country"
+                     :op        :eq
+                     :values    ["US"]}]
+ :rule/match       :all                       ; :all | :any
+ :rule/variation   true                       ; value when rule matches
+ :rule/weight      nil}                       ; nil = 100%, or 0-100
+#+end_src
+
+** Rollout Configuration
+
+#+begin_src clojure :eval no
+{:rollout/enabled     true
+ :rollout/percentage  25                      ; 0-100
+ :rollout/bucket-by   "user.id"               ; attribute for consistent hashing
+ :rollout/seed        "checkout-v2-2026"      ; hash seed for reproducibility
+ :rollout/variations  [{:value true  :weight 25}
+                       {:value false :weight 75}]}
+#+end_src
+
+** Evaluation Context
+
+#+begin_src clojure :eval no
+{:user/id        "usr_abc123"
+ :user/email     "customer@example.com"
+ :user/tier      "premium"
+ :user/country   "US"
+ :user/created   #inst "2025-01-15T..."
+ :device/type    "mobile"
+ :device/os      "ios"
+ :session/id     "sess_xyz789"
+ :custom         {:ab-cohort "treatment-a"}}
+#+end_src
+
+** Evaluation Result
+
+#+begin_src clojure :eval no
+{:flag/key        "checkout-v2"
+ :value           true
+ :reason          :rule-match                 ; :default | :rule-match | :rollout | :disabled
+ :rule-id         "rule-001"                  ; which rule matched (if any)
+ :trace-id        "4bf92f3577b34da6a3ce929d0e0e4736"
+ :evaluation-ms   0.42
+ :cached          true}
+#+end_src
+
+* API Endpoints
+
+** Flag Evaluation API
+
+*** POST /api/v1/evaluate
+
+Evaluate a single flag for given context.
+
+*Request:*
+#+begin_src json
+{
+  "flag_key": "checkout-v2",
+  "context": {
+    "user": {
+      "id": "usr_abc123",
+      "tier": "premium",
+      "country": "US"
+    },
+    "device": {
+      "type": "mobile"
+    }
+  }
+}
+#+end_src
+
+*Headers:*
+| Header       | Value                                                       | Required |
+|--------------+-------------------------------------------------------------+----------|
+| traceparent  | 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01     | Yes      |
+| Content-Type | application/json                                            | Yes      |
+
+*Response (200):*
+#+begin_src json
+{
+  "flag_key": "checkout-v2",
+  "value": true,
+  "reason": "rule-match",
+  "rule_id": "rule-001",
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "evaluation_ms": 0.42
+}
+#+end_src
+
+*Errors:*
+| Code | Condition          | Response                                          |
+|------+--------------------+---------------------------------------------------|
+|  400 | Missing flag_key   | {"error": "flag_key required"}                    |
+|  400 | Missing traceparent| {"error": "traceparent header required"}          |
+|  404 | Flag not found     | {"error": "flag not found", "flag_key": "..."}    |
+
+*** POST /api/v1/evaluate-batch
+
+Evaluate multiple flags in one request.
+
+*Request:*
+#+begin_src json
+{
+  "flag_keys": ["checkout-v2", "express-pay", "loyalty-widget"],
+  "context": {
+    "user": {"id": "usr_abc123", "tier": "premium"}
+  }
+}
+#+end_src
+
+*Response (200):*
+#+begin_src json
+{
+  "evaluations": {
+    "checkout-v2": {"value": true, "reason": "rule-match"},
+    "express-pay": {"value": false, "reason": "rollout"},
+    "loyalty-widget": {"value": "variant-b", "reason": "default"}
+  },
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "evaluation_ms": 1.23
+}
+#+end_src
+
+*** GET /api/v1/flags/:flag-key/evaluation-history
+
+Get recent evaluations for a flag (for debugging).
+
+*Query params:*
+| Param    | Description           | Default |
+|----------+-----------------------+---------|
+| trace_id | Filter by trace-id    | -       |
+| limit    | Max results           | 100     |
+| since    | ISO timestamp         | -1h     |
+
+*Response (200):*
+#+begin_src json
+{
+  "evaluations": [
+    {
+      "timestamp": "2026-05-09T10:23:45Z",
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "user_id": "usr_abc123",
+      "value": true,
+      "reason": "rule-match"
+    }
+  ]
+}
+#+end_src
+
+** Targeting Rules API
+
+*** GET /api/v1/flags/:flag-key/rules
+
+List targeting rules for a flag.
+
+*Response (200):*
+#+begin_src json
+{
+  "rules": [
+    {
+      "id": "rule-001",
+      "description": "Beta users",
+      "clauses": [
+        {"attribute": "user.tier", "op": "in", "values": ["beta", "alpha"]}
+      ],
+      "match": "all",
+      "variation": true
+    }
+  ]
+}
+#+end_src
+
+*** POST /api/v1/flags/:flag-key/rules
+
+Add a targeting rule.
+
+*Request:*
+#+begin_src json
+{
+  "description": "Premium users in US",
+  "clauses": [
+    {"attribute": "user.tier", "op": "eq", "values": ["premium"]},
+    {"attribute": "user.country", "op": "eq", "values": ["US"]}
+  ],
+  "match": "all",
+  "variation": true
+}
+#+end_src
+
+*Response (201):*
+#+begin_src json
+{
+  "id": "rule-002",
+  "description": "Premium users in US",
+  "clauses": [...],
+  "created_at": "2026-05-09T10:30:00Z"
+}
+#+end_src
+
+*** PUT /api/v1/flags/:flag-key/rules/:rule-id
+
+Update a targeting rule.
+
+*** DELETE /api/v1/flags/:flag-key/rules/:rule-id
+
+Delete a targeting rule.
+
+*** PUT /api/v1/flags/:flag-key/rules/reorder
+
+Reorder rules (affects evaluation priority).
+
+*Request:*
+#+begin_src json
+{
+  "rule_ids": ["rule-002", "rule-001", "rule-003"]
+}
+#+end_src
+
+** Targeting Operators
+
+| Operator  | Description                  | Example                                   |
+|-----------+------------------------------+-------------------------------------------|
+| eq        | Equals                       | {"attribute": "user.country", "op": "eq", "values": ["US"]} |
+| neq       | Not equals                   | {"attribute": "user.tier", "op": "neq", "values": ["free"]} |
+| in        | In list                      | {"attribute": "user.tier", "op": "in", "values": ["gold", "plat"]} |
+| not-in    | Not in list                  | {"attribute": "user.status", "op": "not-in", "values": ["banned"]} |
+| contains  | String contains              | {"attribute": "user.email", "op": "contains", "values": ["@acme.com"]} |
+| starts-with| String starts with          | {"attribute": "user.id", "op": "starts-with", "values": ["test_"]} |
+| ends-with | String ends with             | {"attribute": "user.email", "op": "ends-with", "values": [".edu"]} |
+| gt        | Greater than (numeric)       | {"attribute": "user.age", "op": "gt", "values": [18]} |
+| gte       | Greater than or equal        | {"attribute": "user.orders", "op": "gte", "values": [10]} |
+| lt        | Less than                    | {"attribute": "cart.total", "op": "lt", "values": [100]} |
+| lte       | Less than or equal           | {"attribute": "user.risk_score", "op": "lte", "values": [0.5]} |
+| semver-gt | Semver greater than          | {"attribute": "app.version", "op": "semver-gt", "values": ["2.0.0"]} |
+| before    | Date before                  | {"attribute": "user.created", "op": "before", "values": ["2026-01-01"]} |
+| after     | Date after                   | {"attribute": "user.created", "op": "after", "values": ["2025-06-01"]} |
+| regex     | Regex match                  | {"attribute": "user.email", "op": "regex", "values": ["^[a-z]+@"]} |
+
+** Percentage Rollout API
+
+*** GET /api/v1/flags/:flag-key/rollout
+
+Get rollout configuration.
+
+*Response (200):*
+#+begin_src json
+{
+  "enabled": true,
+  "percentage": 25,
+  "bucket_by": "user.id",
+  "seed": "checkout-v2-2026",
+  "variations": [
+    {"value": true, "weight": 25},
+    {"value": false, "weight": 75}
+  ]
+}
+#+end_src
+
+*** PUT /api/v1/flags/:flag-key/rollout
+
+Update rollout configuration.
+
+*Request:*
+#+begin_src json
+{
+  "enabled": true,
+  "percentage": 50,
+  "bucket_by": "user.id",
+  "seed": "checkout-v2-2026-may"
+}
+#+end_src
+
+*** POST /api/v1/flags/:flag-key/rollout/ramp
+
+Gradual percentage ramp.
+
+*Request:*
+#+begin_src json
+{
+  "target_percentage": 100,
+  "step_percentage": 10,
+  "step_interval_minutes": 60,
+  "pause_on_error_rate": 0.05
+}
+#+end_src
+
+*Response (202):*
+#+begin_src json
+{
+  "ramp_id": "ramp-001",
+  "current_percentage": 25,
+  "target_percentage": 100,
+  "next_step_at": "2026-05-09T11:30:00Z",
+  "status": "in_progress"
+}
+#+end_src
+
+*** DELETE /api/v1/flags/:flag-key/rollout/ramp
+
+Cancel active ramp.
+
+** Admin API (Flag CRUD)
+
+*** GET /api/v1/flags
+
+List all flags.
+
+*Query params:*
+| Param    | Description                 | Default |
+|----------+-----------------------------+---------|
+| enabled  | Filter by enabled status    | -       |
+| archived | Include archived flags      | false   |
+| search   | Search by key/name          | -       |
+| limit    | Max results                 | 50      |
+| offset   | Pagination offset           | 0       |
+
+*Response (200):*
+#+begin_src json
+{
+  "flags": [
+    {
+      "key": "checkout-v2",
+      "name": "Checkout V2 Redesign",
+      "kind": "boolean",
+      "enabled": true,
+      "rollout_percentage": 25,
+      "rule_count": 2,
+      "created_at": "2026-05-01T...",
+      "updated_at": "2026-05-09T..."
+    }
+  ],
+  "total": 42,
+  "limit": 50,
+  "offset": 0
+}
+#+end_src
+
+*** POST /api/v1/flags
+
+Create a flag.
+
+*Request:*
+#+begin_src json
+{
+  "key": "express-pay",
+  "name": "Express Payment Button",
+  "description": "Show express pay options on cart page",
+  "kind": "boolean",
+  "default": false,
+  "enabled": false
+}
+#+end_src
+
+*Response (201):*
+#+begin_src json
+{
+  "key": "express-pay",
+  "name": "Express Payment Button",
+  "kind": "boolean",
+  "default": false,
+  "enabled": false,
+  "created_at": "2026-05-09T10:45:00Z"
+}
+#+end_src
+
+*** GET /api/v1/flags/:flag-key
+
+Get flag details.
+
+*Response (200):*
+#+begin_src json
+{
+  "key": "checkout-v2",
+  "name": "Checkout V2 Redesign",
+  "description": "New checkout flow with express payment",
+  "kind": "boolean",
+  "default": false,
+  "enabled": true,
+  "rules": [...],
+  "rollout": {...},
+  "created_at": "2026-05-01T...",
+  "updated_at": "2026-05-09T..."
+}
+#+end_src
+
+*** PUT /api/v1/flags/:flag-key
+
+Update flag.
+
+*** DELETE /api/v1/flags/:flag-key
+
+Archive flag (soft delete).
+
+*** POST /api/v1/flags/:flag-key/toggle
+
+Quick enable/disable toggle.
+
+*Request:*
+#+begin_src json
+{
+  "enabled": true
+}
+#+end_src
+
+** LaunchDarkly Sync API (Optional)
+
+*** GET /api/v1/sync/launchdarkly/status
+
+Get sync status.
+
+*Response (200):*
+#+begin_src json
+{
+  "enabled": true,
+  "last_sync_at": "2026-05-09T10:00:00Z",
+  "sync_direction": "bidirectional",
+  "flags_synced": 35,
+  "conflicts": []
+}
+#+end_src
+
+*** POST /api/v1/sync/launchdarkly/pull
+
+Pull flags from LaunchDarkly.
+
+*Request:*
+#+begin_src json
+{
+  "project_key": "petstore-prod",
+  "environment": "production",
+  "overwrite_local": false
+}
+#+end_src
+
+*** POST /api/v1/sync/launchdarkly/push
+
+Push flags to LaunchDarkly.
+
+*Request:*
+#+begin_src json
+{
+  "flag_keys": ["checkout-v2", "express-pay"],
+  "environment": "staging"
+}
+#+end_src
+
+*** PUT /api/v1/sync/launchdarkly/config
+
+Configure sync settings.
+
+*Request:*
+#+begin_src json
+{
+  "enabled": true,
+  "api_key": "api-xxx-xxx",
+  "project_key": "petstore-prod",
+  "environments": ["production", "staging"],
+  "sync_direction": "bidirectional",
+  "sync_interval_minutes": 5
+}
+#+end_src
+
+* Trace-Aware A/B Correlation
+
+** How Traces Enable Experiment Analysis
+
+The Feature Flags Service embeds trace-id in every evaluation result. This enables:
+
+1. *Impression tracking* — Metrics Platform records which flag value was served,
+   keyed by trace-id
+2. *Conversion correlation* — when an order completes, its trace-id links back to
+   the flag evaluation that determined the checkout variant
+3. *Funnel analysis* — follow trace-id from flag evaluation through cart, checkout,
+   payment to see how each variant affects completion rate
+
+** Sequence: Flag Evaluation to Conversion
+
+#+begin_src mermaid :file flag-trace-flow.png :eval never-export
+sequenceDiagram
+    participant SPA as Storefront SPA
+    participant API as API Gateway
+    participant Flags as Feature Flags
+    participant Metrics as Metrics Platform
+    participant Order as Order Service
+
+    SPA->>+API: GET /cart (traceparent: 00-abc...)
+    API->>+Flags: POST /evaluate "checkout-v2" (traceparent: 00-abc...-child1)
+    Flags->>Flags: Evaluate rules + rollout
+    Flags-->>-API: {value: true, trace_id: "abc..."}
+    API-->>-SPA: Cart page with checkout-v2 enabled
+
+    SPA->>Metrics: Track impression (trace_id: "abc...", flag: "checkout-v2", value: true)
+
+    Note over SPA: User completes checkout
+
+    SPA->>+API: POST /checkout (traceparent: 00-abc...-child2)
+    API->>+Order: Create order
+    Order-->>-API: {order_id: 123}
+    API-->>-SPA: Order confirmed
+
+    SPA->>Metrics: Track conversion (trace_id: "abc...", order_id: 123)
+
+    Note over Metrics: Query: "conversion rate by checkout-v2 value"
+#+end_src
+
+** Experiment Assignment Stability
+
+To ensure users see consistent flag values across requests:
+
+1. Rollout uses consistent hashing: ~murmurhash(bucket-by + flag-key + seed)~
+2. Hash is computed once per user+flag, result is stable
+3. Changing the seed rebalances all users (use for new experiment cohorts)
+
+* Database Schema
+
+** PostgreSQL Tables
+
+#+begin_src sql :eval no
+-- Flags table
+CREATE TABLE flags (
+    key             VARCHAR(255) PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    description     TEXT,
+    kind            VARCHAR(20) NOT NULL DEFAULT 'boolean',
+    default_value   JSONB NOT NULL,
+    enabled         BOOLEAN NOT NULL DEFAULT false,
+    archived        BOOLEAN NOT NULL DEFAULT false,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Targeting rules
+CREATE TABLE flag_rules (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    flag_key        VARCHAR(255) NOT NULL REFERENCES flags(key),
+    description     TEXT,
+    clauses         JSONB NOT NULL,          -- [{attribute, op, values}...]
+    match_type      VARCHAR(10) NOT NULL DEFAULT 'all', -- all | any
+    variation       JSONB NOT NULL,          -- the value when rule matches
+    weight          INTEGER,                 -- null = 100%, or 0-100
+    position        INTEGER NOT NULL,        -- evaluation order
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_flag_rules_flag_key ON flag_rules(flag_key);
+CREATE INDEX idx_flag_rules_position ON flag_rules(flag_key, position);
+
+-- Rollout configuration
+CREATE TABLE flag_rollouts (
+    flag_key        VARCHAR(255) PRIMARY KEY REFERENCES flags(key),
+    enabled         BOOLEAN NOT NULL DEFAULT false,
+    percentage      INTEGER NOT NULL DEFAULT 0,
+    bucket_by       VARCHAR(255) NOT NULL DEFAULT 'user.id',
+    seed            VARCHAR(255),
+    variations      JSONB,                   -- [{value, weight}...]
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Rollout ramps (gradual increase)
+CREATE TABLE flag_ramps (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    flag_key        VARCHAR(255) NOT NULL REFERENCES flags(key),
+    current_pct     INTEGER NOT NULL,
+    target_pct      INTEGER NOT NULL,
+    step_pct        INTEGER NOT NULL,
+    step_interval   INTERVAL NOT NULL,
+    pause_on_error  FLOAT,
+    status          VARCHAR(20) NOT NULL DEFAULT 'active', -- active | paused | completed | cancelled
+    next_step_at    TIMESTAMP WITH TIME ZONE,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_flag_ramps_next_step ON flag_ramps(status, next_step_at);
+
+-- Evaluation audit log (optional, for debugging)
+CREATE TABLE flag_evaluations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    flag_key        VARCHAR(255) NOT NULL,
+    trace_id        VARCHAR(32) NOT NULL,
+    user_id         VARCHAR(255),
+    context_hash    VARCHAR(64),
+    value           JSONB NOT NULL,
+    reason          VARCHAR(20) NOT NULL,
+    rule_id         UUID,
+    evaluation_ms   FLOAT,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Partition by time for efficient cleanup
+CREATE INDEX idx_flag_evaluations_trace ON flag_evaluations(trace_id);
+CREATE INDEX idx_flag_evaluations_created ON flag_evaluations(created_at);
+
+-- LaunchDarkly sync state
+CREATE TABLE launchdarkly_sync (
+    flag_key        VARCHAR(255) PRIMARY KEY REFERENCES flags(key),
+    ld_key          VARCHAR(255) NOT NULL,
+    ld_version      INTEGER,
+    last_synced_at  TIMESTAMP WITH TIME ZONE,
+    sync_direction  VARCHAR(20) NOT NULL DEFAULT 'pull', -- pull | push | bidirectional
+    conflict_at     TIMESTAMP WITH TIME ZONE,
+    conflict_detail JSONB
+);
+#+end_src
+
+** Redis Cache Structure
+
+#+begin_src text
+# Flag definitions (hash)
+flags:checkout-v2 -> {
+  "key": "checkout-v2",
+  "kind": "boolean",
+  "default": false,
+  "enabled": true,
+  "rules": [...],
+  "rollout": {...},
+  "version": 42
+}
+
+# Flag version (for cache invalidation)
+flags:checkout-v2:version -> 42
+
+# All flag keys (set, for batch operations)
+flags:keys -> {"checkout-v2", "express-pay", "loyalty-widget", ...}
+
+# Evaluation cache (optional, with TTL)
+eval:checkout-v2:hash(context) -> {value, reason, expires_at}
+TTL: 60s
+
+# Ramp state
+ramp:checkout-v2 -> {current_pct, target_pct, next_step_at}
+#+end_src
+
+* Error Handling
+
+| Scenario                    | HTTP Code | Error Response                              |
+|-----------------------------+-----------+---------------------------------------------|
+| Flag not found              | 404       | {"error": "flag not found"}                 |
+| Invalid flag key format     | 400       | {"error": "invalid flag key"}               |
+| Missing traceparent         | 400       | {"error": "traceparent header required"}    |
+| Invalid context             | 400       | {"error": "invalid context", "details": {}} |
+| Rule validation failed      | 400       | {"error": "invalid rule", "field": "..."}   |
+| LaunchDarkly sync failed    | 502       | {"error": "LD sync failed", "detail": "..."} |
+| Redis unavailable           | 503       | {"error": "cache unavailable", "fallback": "postgres"} |
+
+* Performance Requirements
+
+| Metric                     | Target    |
+|----------------------------+-----------|
+| Evaluation latency (p50)   | < 5ms     |
+| Evaluation latency (p99)   | < 20ms    |
+| Batch evaluation (10 flags)| < 15ms    |
+| Cache hit rate             | > 95%     |
+| Flag sync latency          | < 1s      |
+
+* Health Endpoints
+
+*** GET /health/live
+
+Liveness probe (is the process running).
+
+*Response (200):*
+#+begin_src json
+{"status": "ok"}
+#+end_src
+
+*** GET /health/ready
+
+Readiness probe (can serve traffic).
+
+*Response (200):*
+#+begin_src json
+{
+  "status": "ok",
+  "checks": {
+    "postgres": "ok",
+    "redis": "ok"
+  }
+}
+#+end_src
+
+*Response (503):*
+#+begin_src json
+{
+  "status": "degraded",
+  "checks": {
+    "postgres": "ok",
+    "redis": "error"
+  }
+}
+#+end_src
+
+* Cross-References
+
+- C4 Component Diagram: [[file:../../docs/architecture/c4/system-landscape.org::*Feature Flags Components]]
+- Metrics Platform: [[file:../metrics/docs/api.org]] (receives evaluation events)
+- L1 Wire Spec: [[file:../../../spec/L1-wire.org]] (traceparent format)
+- trace-spine middleware: [[file:../../../lib/clj/]] (trace context propagation)
+
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

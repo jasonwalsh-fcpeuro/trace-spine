@@ -1,0 +1,44 @@
+{:env #or [#env ENV "dev"]
+
+ :server
+ {:port #long #or [#env PORT 3000]
+  :host "0.0.0.0"}
+
+ :jwt-secret #or [#env JWT_SECRET "CHANGE-ME-IN-PRODUCTION"]
+
+ :redis
+ {:uri #or [#env REDIS_URL "redis://localhost:6379"]}
+
+ :services
+ {:catalog {:url #or [#env CATALOG_SERVICE_URL "http://localhost:3001"]}
+  :cart    {:url #or [#env CART_SERVICE_URL "http://localhost:3002"]}
+  :order   {:url #or [#env ORDER_SERVICE_URL "http://localhost:3003"]}
+  :payment {:url #or [#env PAYMENT_SERVICE_URL "http://localhost:3004"]}
+  :fraud   {:url #or [#env FRAUD_SERVICE_URL "http://localhost:3005"]}
+  :wallet  {:url #or [#env WALLET_SERVICE_URL "http://localhost:3006"]}
+  :wms     {:url #or [#env WMS_SERVICE_URL "http://localhost:3007"]}
+  :flags   {:url #or [#env FLAGS_SERVICE_URL "http://localhost:3008"]}
+  :metrics {:url #or [#env METRICS_SERVICE_URL "http://localhost:3009"]}}
+
+ :trace-spine
+ {:is-ingress? true
+  :strict-mode? #profile {:dev false :prod true}
+  :export-to #or [#env OTEL_EXPORTER_OTLP_ENDPOINT nil]}
+
+ :rate-limiting
+ {:enabled? true
+  :tiers
+  {:anonymous  {:requests-per-min 30  :burst 10}
+   :registered {:requests-per-min 120 :burst 50}
+   :premium    {:requests-per-min 600 :burst 200}
+   :internal   {:requests-per-min 10000 :burst 1000}}}
+
+ :cors
+ {:allowed-origins #profile {:dev ["http://localhost:3000"
+                                   "http://localhost:8080"
+                                   "http://localhost:8280"]
+                             :prod ["https://petstore.example.com"
+                                    "https://admin.petstore.example.com"]}}
+
+ :logging
+ {:level #profile {:dev :debug :prod :info}}}

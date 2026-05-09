@@ -1,0 +1,872 @@
+#+title: WMS Service API Specification
+#+author: trace-spine team
+#+date: 2026-05-09
+#+property: header-args :mkdirp t
+#+options: toc:3 num:t
+
+* Overview
+
+The Warehouse Management System (WMS) service handles inventory management,
+order allocation, fulfillment workflows, shipping integration, and returns
+processing. It is an event-driven service consuming order events from Kafka
+and publishing fulfillment events.
+
+** Trace Propagation
+
+WMS is a downstream consumer in the trace flow:
+
+#+begin_src text
+Order Service --[Kafka: order.created]--> WMS --[Kafka: order.shipped]--> Notifications
+                     ^                          ^
+                     |                          |
+               traceparent in              traceparent preserved
+               message headers             through async flow
+#+end_src
+
+All async operations MUST preserve trace context. This includes:
+- Kafka message headers (traceparent, tracestate)
+- Outbox table rows (traceparent column)
+- External API calls (ShipStation webhook context)
+
+* Component Architecture
+
+#+begin_src mermaid :file wms-components.png :eval never-export
+C4Component
+    title Component Diagram - WMS Service
+
+    Container_Boundary(wms, "WMS Service") {
+        Component(kafka_consumer, "Kafka Consumer", "Clojure", "Consumes order events, extracts traceparent")
+        Component(inventory, "Inventory Manager", "Clojure", "Stock levels, reservations, adjustments")
+        Component(allocator, "Order Allocator", "Clojure", "Assigns inventory to orders")
+        Component(fulfillment, "Fulfillment Engine", "Clojure", "Pick, pack, ship workflow state machine")
+        Component(shipping, "Shipping Integration", "Clojure", "ShipStation API, rate shopping, labels")
+        Component(returns, "Returns Processor", "Clojure", "RMA handling, restocking, refunds trigger")
+        Component(outbox, "Outbox Publisher", "Clojure", "Transactional outbox for events")
+    }
+
+    ContainerDb(postgres, "PostgreSQL", "Inventory, allocations, fulfillments")
+    ContainerQueue(kafka, "Kafka", "order.*, fulfillment.*")
+    System_Ext(shipstation, "ShipStation", "Shipping labels, tracking")
+
+    Rel(kafka_consumer, allocator, "order.created")
+    Rel(allocator, inventory, "reserve_stock")
+    Rel(allocator, fulfillment, "create_fulfillment")
+    Rel(fulfillment, shipping, "request_label")
+    Rel(shipping, shipstation, "HTTPS + traceparent")
+    Rel(fulfillment, outbox, "publish events")
+    Rel(returns, inventory, "restock")
+    Rel(returns, outbox, "return.processed")
+
+    Rel(inventory, postgres, "Reads/Writes")
+    Rel(allocator, postgres, "Reads/Writes")
+    Rel(fulfillment, postgres, "Reads/Writes")
+    Rel(outbox, kafka, "Drain")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+* API Endpoints
+
+** Health & Readiness
+
+*** GET /health
+
+Returns service health status.
+
+#+begin_src clojure
+;; Response
+{:status "ok"
+ :version "1.0.0"
+ :dependencies {:postgres "ok"
+                :kafka "ok"
+                :shipstation "ok"}}
+#+end_src
+
+*** GET /ready
+
+Readiness probe for Kubernetes.
+
+#+begin_src clojure
+;; Response
+{:ready true}
+#+end_src
+
+** Inventory Management API
+
+*** GET /api/v1/inventory/:sku
+
+Retrieve current inventory for a SKU.
+
+*Headers:*
+| Header      | Required | Description              |
+|-------------+----------+--------------------------|
+| traceparent | Yes      | W3C Trace Context        |
+| tracestate  | No       | Vendor-specific state    |
+
+*Response:*
+#+begin_src clojure
+{:sku "PET-FOOD-001"
+ :warehouse_id "WH-EAST-01"
+ :available 150
+ :reserved 25
+ :on_hand 175
+ :reorder_point 50
+ :reorder_quantity 100
+ :updated_at "2026-05-09T12:00:00Z"}
+#+end_src
+
+*** POST /api/v1/inventory/adjust
+
+Adjust inventory levels (receiving, cycle count, damage).
+
+*Request:*
+#+begin_src clojure
+{:sku "PET-FOOD-001"
+ :warehouse_id "WH-EAST-01"
+ :adjustment_type "receiving"  ;; receiving, damage, cycle_count, transfer
+ :quantity 50
+ :reason "PO-12345 received"
+ :reference_id "PO-12345"}
+#+end_src
+
+*Response:*
+#+begin_src clojure
+{:adjustment_id "ADJ-789"
+ :sku "PET-FOOD-001"
+ :previous_on_hand 175
+ :new_on_hand 225
+ :traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+#+end_src
+
+*** POST /api/v1/inventory/reserve
+
+Reserve inventory for an order (idempotent).
+
+*Request:*
+#+begin_src clojure
+{:reservation_id "RES-ORDER-123-001"  ;; idempotency key
+ :order_id "ORDER-123"
+ :items [{:sku "PET-FOOD-001" :quantity 2}
+         {:sku "PET-TOY-003" :quantity 1}]
+ :warehouse_id "WH-EAST-01"
+ :expires_at "2026-05-09T13:00:00Z"}
+#+end_src
+
+*Response:*
+#+begin_src clojure
+{:reservation_id "RES-ORDER-123-001"
+ :status "confirmed"  ;; confirmed, partial, failed
+ :items [{:sku "PET-FOOD-001" :quantity 2 :status "reserved"}
+         {:sku "PET-TOY-003" :quantity 1 :status "reserved"}]
+ :expires_at "2026-05-09T13:00:00Z"}
+#+end_src
+
+*** DELETE /api/v1/inventory/reserve/:reservation_id
+
+Release a reservation (order cancelled, expired).
+
+*Response:*
+#+begin_src clojure
+{:reservation_id "RES-ORDER-123-001"
+ :status "released"
+ :items_released 2}
+#+end_src
+
+** Order Allocation API
+
+*** POST /api/v1/allocations
+
+Create allocation for an order (typically called by Kafka consumer).
+
+*Request:*
+#+begin_src clojure
+{:order_id "ORDER-123"
+ :items [{:sku "PET-FOOD-001" :quantity 2}
+         {:sku "PET-TOY-003" :quantity 1}]
+ :shipping_address {:street "123 Main St"
+                    :city "Boston"
+                    :state "MA"
+                    :zip "02101"
+                    :country "US"}
+ :shipping_method "standard"
+ :traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+#+end_src
+
+*Response:*
+#+begin_src clojure
+{:allocation_id "ALLOC-456"
+ :order_id "ORDER-123"
+ :status "allocated"
+ :warehouse_id "WH-EAST-01"  ;; selected based on proximity/inventory
+ :items [{:sku "PET-FOOD-001" :quantity 2 :location "A-12-3"}
+         {:sku "PET-TOY-003" :quantity 1 :location "B-05-1"}]
+ :fulfillment_id "FULF-789"
+ :traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-child-span-id-01"}
+#+end_src
+
+*** GET /api/v1/allocations/:allocation_id
+
+Retrieve allocation status.
+
+*Response:*
+#+begin_src clojure
+{:allocation_id "ALLOC-456"
+ :order_id "ORDER-123"
+ :status "allocated"
+ :warehouse_id "WH-EAST-01"
+ :created_at "2026-05-09T10:00:00Z"
+ :items [{:sku "PET-FOOD-001"
+          :quantity 2
+          :location "A-12-3"
+          :status "picked"}
+         {:sku "PET-TOY-003"
+          :quantity 1
+          :location "B-05-1"
+          :status "pending"}]}
+#+end_src
+
+** Fulfillment Workflow API
+
+*** Fulfillment State Machine
+
+#+begin_src mermaid :file fulfillment-states.png :eval never-export
+stateDiagram-v2
+    [*] --> pending: allocation_created
+    pending --> picking: start_pick
+    picking --> picked: pick_complete
+    picked --> packing: start_pack
+    packing --> packed: pack_complete
+    packed --> shipping: request_label
+    shipping --> shipped: label_created
+    shipped --> delivered: tracking_delivered
+    delivered --> [*]
+
+    picking --> short: item_unavailable
+    short --> pending: reallocation
+
+    shipped --> returned: return_initiated
+    returned --> restocked: return_received
+    restocked --> [*]
+#+end_src
+
+*** GET /api/v1/fulfillments/:fulfillment_id
+
+Retrieve fulfillment status.
+
+*Response:*
+#+begin_src clojure
+{:fulfillment_id "FULF-789"
+ :order_id "ORDER-123"
+ :allocation_id "ALLOC-456"
+ :status "packed"
+ :warehouse_id "WH-EAST-01"
+ :items [{:sku "PET-FOOD-001" :quantity 2 :status "packed"}
+         {:sku "PET-TOY-003" :quantity 1 :status "packed"}]
+ :timeline [{:status "pending" :at "2026-05-09T10:00:00Z"}
+            {:status "picking" :at "2026-05-09T10:15:00Z" :picker "W-101"}
+            {:status "picked" :at "2026-05-09T10:22:00Z"}
+            {:status "packing" :at "2026-05-09T10:30:00Z" :packer "W-102"}
+            {:status "packed" :at "2026-05-09T10:35:00Z"}]
+ :package {:weight_oz 48
+           :dimensions {:length 12 :width 8 :height 6}}
+ :traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-fulfillment-span-01"}
+#+end_src
+
+*** POST /api/v1/fulfillments/:fulfillment_id/pick
+
+Advance to picking state.
+
+*Request:*
+#+begin_src clojure
+{:picker_id "W-101"
+ :station_id "PICK-STATION-3"}
+#+end_src
+
+*** POST /api/v1/fulfillments/:fulfillment_id/pick/complete
+
+Complete picking (scan all items).
+
+*Request:*
+#+begin_src clojure
+{:picker_id "W-101"
+ :items [{:sku "PET-FOOD-001" :quantity 2 :scanned true}
+         {:sku "PET-TOY-003" :quantity 1 :scanned true}]}
+#+end_src
+
+*** POST /api/v1/fulfillments/:fulfillment_id/pack
+
+Advance to packing state.
+
+*Request:*
+#+begin_src clojure
+{:packer_id "W-102"
+ :station_id "PACK-STATION-1"}
+#+end_src
+
+*** POST /api/v1/fulfillments/:fulfillment_id/pack/complete
+
+Complete packing.
+
+*Request:*
+#+begin_src clojure
+{:packer_id "W-102"
+ :package {:weight_oz 48
+           :dimensions {:length 12 :width 8 :height 6}
+           :box_type "medium"}}
+#+end_src
+
+*** POST /api/v1/fulfillments/:fulfillment_id/ship
+
+Request shipping label and ship.
+
+*Request:*
+#+begin_src clojure
+{:carrier_preference ["usps" "ups" "fedex"]  ;; rate shop in order
+ :service_level "ground"
+ :signature_required false
+ :insurance_value nil}
+#+end_src
+
+*Response:*
+#+begin_src clojure
+{:fulfillment_id "FULF-789"
+ :status "shipped"
+ :shipment {:carrier "usps"
+            :service "priority_mail"
+            :tracking_number "9400111899223033005050"
+            :label_url "https://shipstation.com/labels/..."
+            :estimated_delivery "2026-05-12"
+            :cost_cents 895}
+ :traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-ship-span-id-01"}
+#+end_src
+
+** ShipStation Integration
+
+*** Configuration
+
+#+begin_src clojure
+{:shipstation {:api-key "ENV:SHIPSTATION_API_KEY"
+               :api-secret "ENV:SHIPSTATION_API_SECRET"
+               :base-url "https://ssapi.shipstation.com"
+               :timeout-ms 30000
+               :retry {:max-attempts 3
+                       :backoff-ms [1000 2000 4000]}}}
+#+end_src
+
+*** Trace Propagation to ShipStation
+
+ShipStation webhooks do not support trace context headers. We handle this via:
+
+1. Store traceparent in fulfillment record before API call
+2. Include traceparent in ShipStation order metadata (~customField1~)
+3. On webhook receipt, extract from metadata and continue trace
+
+#+begin_src clojure
+;; Outbound request to ShipStation
+(defn create-shipstation-order
+  [{:keys [fulfillment traceparent]}]
+  (let [child-ctx (trace/create-child traceparent)]
+    {:orderId (:order_id fulfillment)
+     :orderNumber (:order_id fulfillment)
+     :customField1 (trace/format child-ctx)  ;; preserve trace
+     :shipTo (format-address (:shipping_address fulfillment))
+     :items (map format-item (:items fulfillment))
+     ;; ... rest of ShipStation order
+     }))
+
+;; Webhook handler
+(defn handle-shipstation-webhook
+  [webhook-payload]
+  (let [traceparent (get-in webhook-payload [:resource :customField1])
+        ctx (trace/continue-or-start {"traceparent" traceparent} false)]
+    (trace/with-span ctx "shipstation.webhook"
+      ;; process webhook
+      )))
+#+end_src
+
+*** Rate Shopping
+
+#+begin_src clojure
+(defn get-shipping-rates
+  [{:keys [fulfillment carriers]}]
+  ;; POST /shipments/getrates
+  ;; Returns rates sorted by cost
+  [{:carrier "usps"
+    :service "priority_mail"
+    :cost_cents 895
+    :delivery_days 2}
+   {:carrier "ups"
+    :service "ground"
+    :cost_cents 1250
+    :delivery_days 5}])
+#+end_src
+
+*** Label Generation
+
+#+begin_src clojure
+(defn create-label
+  [{:keys [fulfillment rate]}]
+  ;; POST /shipments/createlabel
+  {:tracking_number "9400111899223033005050"
+   :label_url "https://..."
+   :carrier (:carrier rate)
+   :service (:service rate)})
+#+end_src
+
+** Returns Processing API
+
+*** POST /api/v1/returns
+
+Initiate a return (RMA).
+
+*Request:*
+#+begin_src clojure
+{:order_id "ORDER-123"
+ :items [{:sku "PET-TOY-003"
+          :quantity 1
+          :reason "damaged"
+          :condition "unopened"}]
+ :return_type "refund"  ;; refund, exchange, store_credit
+ :traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-return-init-01"}
+#+end_src
+
+*Response:*
+#+begin_src clojure
+{:return_id "RET-321"
+ :rma_number "RMA-2026-00321"
+ :status "initiated"
+ :return_label {:carrier "usps"
+                :tracking_number "9400111899223033005051"
+                :label_url "https://..."}
+ :items [{:sku "PET-TOY-003"
+          :quantity 1
+          :expected_refund_cents 1599}]
+ :traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-return-span-01"}
+#+end_src
+
+*** POST /api/v1/returns/:return_id/receive
+
+Process received return.
+
+*Request:*
+#+begin_src clojure
+{:receiver_id "W-103"
+ :items [{:sku "PET-TOY-003"
+          :quantity 1
+          :condition "resellable"  ;; resellable, damaged, defective
+          :location "A-05-1"}]}  ;; restock location if resellable
+#+end_src
+
+*Response:*
+#+begin_src clojure
+{:return_id "RET-321"
+ :status "received"
+ :items [{:sku "PET-TOY-003"
+          :quantity 1
+          :condition "resellable"
+          :restocked true
+          :refund_approved true}]
+ :next_action "refund_processing"}  ;; triggers refund via Kafka
+#+end_src
+
+*** GET /api/v1/returns/:return_id
+
+Retrieve return status.
+
+*Response:*
+#+begin_src clojure
+{:return_id "RET-321"
+ :rma_number "RMA-2026-00321"
+ :order_id "ORDER-123"
+ :status "completed"
+ :timeline [{:status "initiated" :at "2026-05-09T14:00:00Z"}
+            {:status "in_transit" :at "2026-05-10T09:00:00Z"}
+            {:status "received" :at "2026-05-11T11:00:00Z" :receiver "W-103"}
+            {:status "restocked" :at "2026-05-11T11:05:00Z"}
+            {:status "refund_processed" :at "2026-05-11T12:00:00Z"}
+            {:status "completed" :at "2026-05-11T12:00:00Z"}]
+ :items [{:sku "PET-TOY-003"
+          :quantity 1
+          :condition "resellable"
+          :refund_cents 1599}]
+ :traceparent "00-4bf92f3577b34da6a3ce929d0e0e4736-return-span-01"}
+#+end_src
+
+* Kafka Events
+
+** Consumed Topics
+
+*** order.created
+
+Triggers allocation flow.
+
+#+begin_src clojure
+{:event_type "order.created"
+ :order_id "ORDER-123"
+ :items [{:sku "PET-FOOD-001" :quantity 2}
+         {:sku "PET-TOY-003" :quantity 1}]
+ :shipping_address {:street "123 Main St"
+                    :city "Boston"
+                    :state "MA"
+                    :zip "02101"
+                    :country "US"}
+ :shipping_method "standard"
+ :created_at "2026-05-09T10:00:00Z"}
+
+;; Kafka headers:
+;; traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-order-span-id-01
+;; tracestate: (optional)
+#+end_src
+
+*** order.cancelled
+
+Releases reservations, cancels fulfillment if not shipped.
+
+#+begin_src clojure
+{:event_type "order.cancelled"
+ :order_id "ORDER-123"
+ :reason "customer_request"
+ :cancelled_at "2026-05-09T10:30:00Z"}
+#+end_src
+
+** Published Topics
+
+*** fulfillment.allocated
+
+Published when inventory is allocated.
+
+#+begin_src clojure
+{:event_type "fulfillment.allocated"
+ :fulfillment_id "FULF-789"
+ :order_id "ORDER-123"
+ :allocation_id "ALLOC-456"
+ :warehouse_id "WH-EAST-01"
+ :items [{:sku "PET-FOOD-001" :quantity 2}
+         {:sku "PET-TOY-003" :quantity 1}]
+ :allocated_at "2026-05-09T10:00:00Z"}
+
+;; traceparent preserved from order.created
+#+end_src
+
+*** fulfillment.shipped
+
+Published when shipment is created.
+
+#+begin_src clojure
+{:event_type "fulfillment.shipped"
+ :fulfillment_id "FULF-789"
+ :order_id "ORDER-123"
+ :carrier "usps"
+ :tracking_number "9400111899223033005050"
+ :shipped_at "2026-05-09T11:00:00Z"}
+#+end_src
+
+*** fulfillment.delivered
+
+Published when tracking shows delivered.
+
+#+begin_src clojure
+{:event_type "fulfillment.delivered"
+ :fulfillment_id "FULF-789"
+ :order_id "ORDER-123"
+ :delivered_at "2026-05-12T14:30:00Z"}
+#+end_src
+
+*** return.initiated
+
+Published when RMA is created.
+
+#+begin_src clojure
+{:event_type "return.initiated"
+ :return_id "RET-321"
+ :order_id "ORDER-123"
+ :items [{:sku "PET-TOY-003" :quantity 1}]
+ :initiated_at "2026-05-09T14:00:00Z"}
+#+end_src
+
+*** return.processed
+
+Published when return is complete, triggers refund.
+
+#+begin_src clojure
+{:event_type "return.processed"
+ :return_id "RET-321"
+ :order_id "ORDER-123"
+ :items [{:sku "PET-TOY-003"
+          :quantity 1
+          :condition "resellable"
+          :refund_cents 1599}]
+ :action "refund"  ;; refund, exchange, store_credit
+ :processed_at "2026-05-11T12:00:00Z"}
+#+end_src
+
+*** inventory.low_stock
+
+Published when SKU drops below reorder point.
+
+#+begin_src clojure
+{:event_type "inventory.low_stock"
+ :sku "PET-FOOD-001"
+ :warehouse_id "WH-EAST-01"
+ :available 45
+ :reorder_point 50
+ :detected_at "2026-05-09T15:00:00Z"}
+#+end_src
+
+* Trace Propagation Patterns
+
+** Kafka Consumer Pattern
+
+#+begin_src clojure
+(defn handle-order-created
+  [message]
+  (let [headers (kafka/headers message)
+        traceparent (get headers "traceparent")
+        ctx (trace/continue-or-start {"traceparent" traceparent} false)]
+    (trace/with-span ctx "wms.handle-order-created"
+      (let [order (:value message)
+            allocation (allocate-order ctx order)]
+        (publish-with-trace ctx "fulfillment.allocated" allocation)))))
+
+(defn publish-with-trace
+  [ctx topic event]
+  (let [child-ctx (trace/create-child ctx)
+        headers {"traceparent" (trace/format child-ctx)}]
+    (kafka/send! {:topic topic
+                  :headers headers
+                  :value event})))
+#+end_src
+
+** Outbox Pattern for Transactional Events
+
+#+begin_src clojure
+(defn allocate-order-transactionally
+  [ctx order]
+  (jdbc/with-transaction [tx db-spec]
+    ;; Reserve inventory
+    (inventory/reserve! tx (:items order))
+
+    ;; Create allocation record
+    (let [allocation (allocations/create! tx order)]
+
+      ;; Write to outbox within same transaction
+      (outbox/insert! tx
+        {:event_type "fulfillment.allocated"
+         :aggregate_id (:allocation_id allocation)
+         :payload allocation
+         :traceparent (trace/format ctx)})
+
+      allocation)))
+
+;; Separate process drains outbox to Kafka
+(defn drain-outbox
+  []
+  (doseq [row (outbox/pending-events db-spec)]
+    (let [ctx (trace/parse (:traceparent row))]
+      (trace/with-span ctx "outbox.publish"
+        (kafka/send! {:topic (event->topic (:event_type row))
+                      :headers {"traceparent" (:traceparent row)}
+                      :value (:payload row)})
+        (outbox/mark-published! db-spec (:id row))))))
+#+end_src
+
+** HTTP Client Pattern (ShipStation)
+
+#+begin_src clojure
+(defn call-shipstation
+  [ctx endpoint body]
+  (let [child-ctx (trace/create-child ctx)]
+    (trace/with-span child-ctx "shipstation.api"
+      (http/post (str shipstation-base-url endpoint)
+        {:headers {"Authorization" (shipstation-auth)
+                   "Content-Type" "application/json"
+                   ;; ShipStation doesn't use traceparent header,
+                   ;; but we record it for correlation
+                   "X-Request-Id" (:span_id child-ctx)}
+         :body (json/encode body)
+         :timeout 30000}))))
+#+end_src
+
+* Database Schema
+
+** inventory table
+
+#+begin_src sql
+CREATE TABLE inventory (
+    sku VARCHAR(100) NOT NULL,
+    warehouse_id VARCHAR(50) NOT NULL,
+    on_hand INTEGER NOT NULL DEFAULT 0,
+    reserved INTEGER NOT NULL DEFAULT 0,
+    available INTEGER GENERATED ALWAYS AS (on_hand - reserved) STORED,
+    reorder_point INTEGER NOT NULL DEFAULT 0,
+    reorder_quantity INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    PRIMARY KEY (sku, warehouse_id)
+);
+
+CREATE INDEX idx_inventory_low_stock ON inventory(warehouse_id, available)
+    WHERE available < reorder_point;
+#+end_src
+
+** reservations table
+
+#+begin_src sql
+CREATE TABLE reservations (
+    reservation_id VARCHAR(100) PRIMARY KEY,
+    order_id VARCHAR(100) NOT NULL,
+    warehouse_id VARCHAR(50) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    traceparent VARCHAR(55) NOT NULL
+);
+
+CREATE TABLE reservation_items (
+    reservation_id VARCHAR(100) REFERENCES reservations(reservation_id),
+    sku VARCHAR(100) NOT NULL,
+    quantity INTEGER NOT NULL,
+    PRIMARY KEY (reservation_id, sku)
+);
+
+CREATE INDEX idx_reservations_expires ON reservations(expires_at)
+    WHERE status = 'active';
+#+end_src
+
+** allocations table
+
+#+begin_src sql
+CREATE TABLE allocations (
+    allocation_id VARCHAR(100) PRIMARY KEY,
+    order_id VARCHAR(100) NOT NULL,
+    warehouse_id VARCHAR(50) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'allocated',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    traceparent VARCHAR(55) NOT NULL
+);
+
+CREATE TABLE allocation_items (
+    allocation_id VARCHAR(100) REFERENCES allocations(allocation_id),
+    sku VARCHAR(100) NOT NULL,
+    quantity INTEGER NOT NULL,
+    location VARCHAR(50),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY (allocation_id, sku)
+);
+#+end_src
+
+** fulfillments table
+
+#+begin_src sql
+CREATE TABLE fulfillments (
+    fulfillment_id VARCHAR(100) PRIMARY KEY,
+    order_id VARCHAR(100) NOT NULL,
+    allocation_id VARCHAR(100) REFERENCES allocations(allocation_id),
+    warehouse_id VARCHAR(50) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    picker_id VARCHAR(50),
+    packer_id VARCHAR(50),
+    weight_oz INTEGER,
+    dimensions JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    traceparent VARCHAR(55) NOT NULL
+);
+
+CREATE TABLE fulfillment_items (
+    fulfillment_id VARCHAR(100) REFERENCES fulfillments(fulfillment_id),
+    sku VARCHAR(100) NOT NULL,
+    quantity INTEGER NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY (fulfillment_id, sku)
+);
+
+CREATE TABLE fulfillment_timeline (
+    id SERIAL PRIMARY KEY,
+    fulfillment_id VARCHAR(100) REFERENCES fulfillments(fulfillment_id),
+    status VARCHAR(20) NOT NULL,
+    actor VARCHAR(50),
+    occurred_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+#+end_src
+
+** shipments table
+
+#+begin_src sql
+CREATE TABLE shipments (
+    shipment_id VARCHAR(100) PRIMARY KEY,
+    fulfillment_id VARCHAR(100) REFERENCES fulfillments(fulfillment_id),
+    carrier VARCHAR(20) NOT NULL,
+    service VARCHAR(50) NOT NULL,
+    tracking_number VARCHAR(100),
+    label_url TEXT,
+    cost_cents INTEGER,
+    estimated_delivery DATE,
+    actual_delivery TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    traceparent VARCHAR(55) NOT NULL
+);
+
+CREATE INDEX idx_shipments_tracking ON shipments(tracking_number);
+#+end_src
+
+** returns table
+
+#+begin_src sql
+CREATE TABLE returns (
+    return_id VARCHAR(100) PRIMARY KEY,
+    rma_number VARCHAR(50) UNIQUE NOT NULL,
+    order_id VARCHAR(100) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'initiated',
+    return_type VARCHAR(20) NOT NULL,
+    return_tracking_number VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    traceparent VARCHAR(55) NOT NULL
+);
+
+CREATE TABLE return_items (
+    return_id VARCHAR(100) REFERENCES returns(return_id),
+    sku VARCHAR(100) NOT NULL,
+    quantity INTEGER NOT NULL,
+    reason VARCHAR(50),
+    condition VARCHAR(20),
+    refund_cents INTEGER,
+    PRIMARY KEY (return_id, sku)
+);
+
+CREATE TABLE return_timeline (
+    id SERIAL PRIMARY KEY,
+    return_id VARCHAR(100) REFERENCES returns(return_id),
+    status VARCHAR(20) NOT NULL,
+    actor VARCHAR(50),
+    occurred_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+#+end_src
+
+** outbox table
+
+See spec/L1-wire.org for canonical schema.
+
+#+begin_src sql
+CREATE TABLE outbox (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_id VARCHAR(255) NOT NULL,
+    event_type VARCHAR(255) NOT NULL,
+    payload JSONB NOT NULL,
+    traceparent VARCHAR(55) NOT NULL,
+    tracestate TEXT,
+    published_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_outbox_pending ON outbox(created_at)
+    WHERE published_at IS NULL;
+#+end_src
+
+* Cross-References
+
+- System landscape: [[file:../../docs/architecture/c4/system-landscape.org]]
+- Wire format: [[file:../../../spec/L1-wire.org]]
+- Function contracts: [[file:../../../spec/L1-contracts.org]]
+- Order service (upstream): [[file:../../order/docs/api.org]]
+- Payment service (returns integration): [[file:../../payments/docs/api.org]]

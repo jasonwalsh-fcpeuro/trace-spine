@@ -1,0 +1,710 @@
+#+title: Wallet Service API Specification
+#+author: trace-spine team
+#+date: 2026-05-09
+#+property: header-args :mkdirp t
+#+options: toc:3 num:t
+
+* Overview
+
+The Wallet Service manages customer financial instruments that exist within the
+platform: store credits, gift cards, and loyalty points. It provides balance
+management, credit application with idempotency guarantees, and transaction
+history tracking.
+
+The Wallet Service is called by the Payment Service during checkout to apply
+any available credits before external payment processing (Stripe/PayPal).
+
+** Design Principles
+
+1. *Idempotency First* — Every credit application operation uses idempotency
+   keys to prevent double-spending or double-crediting
+2. *Trace Propagation* — All operations carry traceparent for payment-wallet
+   coordination visibility
+3. *Ledger Immutability* — Balance changes are append-only ledger entries;
+   corrections are compensating transactions
+4. *Pessimistic Locking* — Balance checks and debits use SELECT FOR UPDATE
+   to prevent race conditions
+
+** Service Boundaries
+
+| Wallet Service Owns                 | Payment Service Owns                |
+|-------------------------------------+-------------------------------------|
+| Store credit balances               | Payment method selection            |
+| Gift card redemption                | External payment processing         |
+| Loyalty points accrual/redemption   | Payment orchestration               |
+| Balance inquiry                     | Idempotency for external charges    |
+| Transaction ledger                  | Retry logic for external APIs       |
+| Plaid bank verification             | Outbox publishing                   |
+
+* Component Diagram
+
+#+begin_src mermaid :file c4-component-wallet.png :eval never-export
+C4Component
+    title Component Diagram - Wallet Service
+
+    Container_Boundary(wallet, "Wallet Service") {
+        Component(balance_mgr, "Balance Manager", "Clojure", "Queries and updates wallet balances")
+        Component(credit_applicator, "Credit Applicator", "Clojure", "Applies credits with idempotency")
+        Component(gift_card, "Gift Card Engine", "Clojure", "Gift card validation and redemption")
+        Component(loyalty, "Loyalty Engine", "Clojure", "Points accrual and redemption rules")
+        Component(ledger, "Transaction Ledger", "Clojure", "Immutable transaction log")
+        Component(plaid_adapter, "Plaid Adapter", "Clojure", "Bank verification via Plaid")
+    }
+
+    Container(payments, "Payment Service")
+    ContainerDb(postgres, "PostgreSQL")
+    System_Ext(plaid, "Plaid")
+
+    Rel(payments, balance_mgr, "Queries balance", "HTTP + traceparent")
+    Rel(payments, credit_applicator, "Applies credit", "HTTP + traceparent")
+
+    Rel(balance_mgr, ledger, "Reads")
+    Rel(credit_applicator, ledger, "Writes")
+    Rel(credit_applicator, balance_mgr, "Validates balance")
+
+    Rel(gift_card, ledger, "Reads/Writes")
+    Rel(loyalty, ledger, "Reads/Writes")
+    Rel(plaid_adapter, plaid, "HTTPS")
+
+    Rel(ledger, postgres, "Reads/Writes")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+* Data Model
+
+** Schema
+
+#+begin_src sql
+-- Wallet accounts (one per customer, auto-created on first interaction)
+CREATE TABLE wallet_accounts (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id     UUID NOT NULL UNIQUE,
+    store_credit    DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    loyalty_points  INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_wallet_accounts_customer ON wallet_accounts(customer_id);
+
+-- Gift cards (can be transferred between customers)
+CREATE TABLE gift_cards (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code            VARCHAR(32) NOT NULL UNIQUE,
+    original_amount DECIMAL(12,2) NOT NULL,
+    current_balance DECIMAL(12,2) NOT NULL,
+    currency        VARCHAR(3) NOT NULL DEFAULT 'USD',
+    issued_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    expires_at      TIMESTAMP WITH TIME ZONE,
+    redeemed_by     UUID REFERENCES wallet_accounts(id),
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_gift_cards_code ON gift_cards(code);
+CREATE INDEX idx_gift_cards_redeemed_by ON gift_cards(redeemed_by);
+
+-- Transaction ledger (append-only)
+CREATE TABLE wallet_transactions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wallet_account_id   UUID NOT NULL REFERENCES wallet_accounts(id),
+    transaction_type    VARCHAR(32) NOT NULL,
+    instrument_type     VARCHAR(16) NOT NULL,  -- 'store_credit', 'gift_card', 'loyalty_points'
+    amount              DECIMAL(12,2) NOT NULL,
+    points_amount       INTEGER,               -- For loyalty transactions
+    balance_before      DECIMAL(12,2) NOT NULL,
+    balance_after       DECIMAL(12,2) NOT NULL,
+    idempotency_key     VARCHAR(64) NOT NULL,
+    reference_type      VARCHAR(32),           -- 'order', 'refund', 'adjustment', 'gift_card'
+    reference_id        UUID,
+    gift_card_id        UUID REFERENCES gift_cards(id),
+    description         TEXT,
+    traceparent         VARCHAR(55) NOT NULL,
+    tracestate          TEXT,
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(idempotency_key, wallet_account_id)
+);
+
+CREATE INDEX idx_wallet_txn_account ON wallet_transactions(wallet_account_id);
+CREATE INDEX idx_wallet_txn_idempotency ON wallet_transactions(idempotency_key);
+CREATE INDEX idx_wallet_txn_reference ON wallet_transactions(reference_type, reference_id);
+CREATE INDEX idx_wallet_txn_created ON wallet_transactions(created_at);
+CREATE INDEX idx_wallet_txn_traceparent ON wallet_transactions(traceparent);
+
+-- Bank accounts (verified via Plaid)
+CREATE TABLE verified_bank_accounts (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    wallet_account_id   UUID NOT NULL REFERENCES wallet_accounts(id),
+    plaid_access_token  TEXT NOT NULL,          -- Encrypted at rest
+    plaid_account_id    VARCHAR(64) NOT NULL,
+    institution_name    VARCHAR(128),
+    account_mask        VARCHAR(4),             -- Last 4 digits
+    account_type        VARCHAR(32),            -- 'checking', 'savings'
+    verification_status VARCHAR(32) NOT NULL,   -- 'pending', 'verified', 'failed'
+    verified_at         TIMESTAMP WITH TIME ZONE,
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_bank_accounts_wallet ON verified_bank_accounts(wallet_account_id);
+#+end_src
+
+** Transaction Types
+
+| Type                  | Instrument   | Direction | Description                      |
+|-----------------------+--------------+-----------+----------------------------------|
+| credit_issued         | store_credit | +         | Credit added by merchant/support |
+| credit_applied        | store_credit | -         | Credit used at checkout          |
+| credit_refund         | store_credit | +         | Credit from order refund         |
+| gift_card_redeemed    | gift_card    | +         | Gift card added to wallet        |
+| gift_card_applied     | gift_card    | -         | Gift card used at checkout       |
+| loyalty_earned        | loyalty      | +         | Points earned from purchase      |
+| loyalty_redeemed      | loyalty      | -         | Points used for discount         |
+| loyalty_expired       | loyalty      | -         | Points expired (system action)   |
+| adjustment_credit     | any          | +         | Manual adjustment (audit trail)  |
+| adjustment_debit      | any          | -         | Manual adjustment (audit trail)  |
+
+* REST API
+
+** Base URL
+
+~https://api.petstore.example/internal/wallet/v1~
+
+This is an internal API called by Payment Service. It is NOT exposed to the
+public API Gateway.
+
+** Authentication
+
+Internal service-to-service authentication via mTLS. No user tokens.
+
+** Common Headers
+
+| Header        | Required | Description                     |
+|---------------+----------+---------------------------------|
+| traceparent   | Yes      | W3C Trace Context parent        |
+| tracestate    | No       | W3C Trace Context vendor state  |
+| Idempotency-Key | Yes*   | Required for mutating operations |
+| X-Request-Id  | No       | Correlation ID from Payment Svc |
+
+** Endpoints
+
+*** Balance Inquiry
+
+**** GET /accounts/{customer_id}/balance
+
+Returns the current balance across all wallet instruments.
+
+**Request:**
+#+begin_src http
+GET /accounts/550e8400-e29b-41d4-a716-446655440000/balance HTTP/1.1
+Host: wallet-service.internal
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+#+end_src
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "customer_id": "550e8400-e29b-41d4-a716-446655440000",
+  "balances": {
+    "store_credit": {
+      "amount": "45.00",
+      "currency": "USD"
+    },
+    "gift_card": {
+      "amount": "100.00",
+      "currency": "USD",
+      "card_count": 2
+    },
+    "loyalty_points": {
+      "points": 1250,
+      "monetary_value": "12.50",
+      "currency": "USD"
+    }
+  },
+  "total_available": {
+    "amount": "157.50",
+    "currency": "USD"
+  },
+  "queried_at": "2026-05-09T14:30:00Z"
+}
+#+end_src
+
+**Response (404 Not Found):** Customer has no wallet (will be auto-created on first credit)
+
+*** Apply Credit
+
+**** POST /accounts/{customer_id}/apply
+
+Applies wallet credit to an order. This is the primary integration point with
+Payment Service. Supports partial application.
+
+**Request:**
+#+begin_src http
+POST /accounts/550e8400-e29b-41d4-a716-446655440000/apply HTTP/1.1
+Host: wallet-service.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+Idempotency-Key: order-123-wallet-apply-v1
+
+{
+  "order_id": "order-123",
+  "requested_amount": "50.00",
+  "currency": "USD",
+  "instrument_priority": ["store_credit", "gift_card", "loyalty_points"],
+  "max_loyalty_percentage": 0.20
+}
+#+end_src
+
+**Parameters:**
+
+| Field                  | Type     | Required | Description                                |
+|------------------------+----------+----------+--------------------------------------------|
+| order_id               | string   | Yes      | Order reference for ledger                 |
+| requested_amount       | decimal  | Yes      | Amount to apply from wallet                |
+| currency               | string   | Yes      | ISO 4217 currency code                     |
+| instrument_priority    | string[] | No       | Order to drain instruments (default shown) |
+| max_loyalty_percentage | decimal  | No       | Max order % payable via points (0.0-1.0)   |
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "applied": {
+    "total": "50.00",
+    "breakdown": [
+      {
+        "instrument": "store_credit",
+        "amount": "45.00",
+        "transaction_id": "txn-abc-123"
+      },
+      {
+        "instrument": "loyalty_points",
+        "amount": "5.00",
+        "points_used": 50,
+        "transaction_id": "txn-abc-124"
+      }
+    ]
+  },
+  "remaining_balance": {
+    "store_credit": "0.00",
+    "gift_card": "100.00",
+    "loyalty_points": "7.50"
+  },
+  "idempotency_key": "order-123-wallet-apply-v1",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-cafe0123deadbeef-01"
+}
+#+end_src
+
+**Response (409 Conflict):** Idempotency key reused with different parameters
+
+**Response (422 Unprocessable Entity):** Insufficient balance
+
+*** Refund Credit
+
+**** POST /accounts/{customer_id}/refund
+
+Refunds wallet credit from a cancelled/refunded order.
+
+**Request:**
+#+begin_src http
+POST /accounts/550e8400-e29b-41d4-a716-446655440000/refund HTTP/1.1
+Host: wallet-service.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+Idempotency-Key: order-123-wallet-refund-v1
+
+{
+  "order_id": "order-123",
+  "original_transaction_ids": ["txn-abc-123", "txn-abc-124"],
+  "refund_as": "store_credit"
+}
+#+end_src
+
+**Parameters:**
+
+| Field                    | Type     | Required | Description                             |
+|--------------------------+----------+----------+-----------------------------------------|
+| order_id                 | string   | Yes      | Order reference                         |
+| original_transaction_ids | string[] | Yes      | Original apply transaction IDs          |
+| refund_as                | string   | No       | Instrument to refund to (default: same) |
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "refunded": {
+    "total": "50.00",
+    "breakdown": [
+      {
+        "instrument": "store_credit",
+        "amount": "50.00",
+        "transaction_id": "txn-abc-125"
+      }
+    ]
+  },
+  "new_balance": {
+    "store_credit": "50.00",
+    "gift_card": "100.00",
+    "loyalty_points": "7.50"
+  }
+}
+#+end_src
+
+*** Transaction History
+
+**** GET /accounts/{customer_id}/transactions
+
+Returns paginated transaction history.
+
+**Request:**
+#+begin_src http
+GET /accounts/550e8400-e29b-41d4-a716-446655440000/transactions?limit=20&instrument=store_credit HTTP/1.1
+Host: wallet-service.internal
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+#+end_src
+
+**Query Parameters:**
+
+| Parameter  | Type   | Default | Description                           |
+|------------+--------+---------+---------------------------------------|
+| limit      | int    | 50      | Max records (1-100)                   |
+| offset     | int    | 0       | Pagination offset                     |
+| instrument | string | all     | Filter by instrument type             |
+| start_date | ISO8601| null    | Filter transactions after this date   |
+| end_date   | ISO8601| null    | Filter transactions before this date  |
+| order_id   | string | null    | Filter by order reference             |
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "transactions": [
+    {
+      "id": "txn-abc-123",
+      "type": "credit_applied",
+      "instrument": "store_credit",
+      "amount": "-45.00",
+      "balance_after": "0.00",
+      "reference_type": "order",
+      "reference_id": "order-123",
+      "description": "Applied to order #123",
+      "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      "created_at": "2026-05-09T14:30:00Z"
+    }
+  ],
+  "pagination": {
+    "total": 42,
+    "limit": 20,
+    "offset": 0,
+    "has_more": true
+  }
+}
+#+end_src
+
+*** Gift Card Operations
+
+**** POST /gift-cards/validate
+
+Validates a gift card code without redeeming it.
+
+**Request:**
+#+begin_src http
+POST /gift-cards/validate HTTP/1.1
+Host: wallet-service.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+{
+  "code": "GIFT-ABCD-1234-EFGH"
+}
+#+end_src
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "valid": true,
+  "balance": "50.00",
+  "currency": "USD",
+  "expires_at": "2027-12-31T23:59:59Z",
+  "is_redeemed": false
+}
+#+end_src
+
+**Response (200 OK, invalid):**
+#+begin_src json
+{
+  "valid": false,
+  "reason": "expired"
+}
+#+end_src
+
+**** POST /accounts/{customer_id}/gift-cards/redeem
+
+Redeems a gift card to the customer's wallet.
+
+**Request:**
+#+begin_src http
+POST /accounts/550e8400-e29b-41d4-a716-446655440000/gift-cards/redeem HTTP/1.1
+Host: wallet-service.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+Idempotency-Key: redeem-GIFT-ABCD-1234-EFGH
+
+{
+  "code": "GIFT-ABCD-1234-EFGH"
+}
+#+end_src
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "redeemed": true,
+  "amount": "50.00",
+  "currency": "USD",
+  "transaction_id": "txn-def-456",
+  "new_gift_card_balance": "150.00"
+}
+#+end_src
+
+**Response (409 Conflict):** Gift card already redeemed by another customer
+
+**Response (422 Unprocessable Entity):** Gift card expired or invalid
+
+*** Loyalty Points
+
+**** POST /accounts/{customer_id}/loyalty/earn
+
+Awards loyalty points from a completed order.
+
+**Request:**
+#+begin_src http
+POST /accounts/550e8400-e29b-41d4-a716-446655440000/loyalty/earn HTTP/1.1
+Host: wallet-service.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+Idempotency-Key: order-123-loyalty-earn
+
+{
+  "order_id": "order-123",
+  "order_total": "150.00",
+  "currency": "USD",
+  "multiplier": 1.0
+}
+#+end_src
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "points_earned": 150,
+  "multiplier_applied": 1.0,
+  "bonus_points": 0,
+  "total_points": 150,
+  "new_balance": 1400,
+  "transaction_id": "txn-ghi-789"
+}
+#+end_src
+
+*** Plaid Bank Verification
+
+**** POST /accounts/{customer_id}/bank/link-token
+
+Creates a Plaid Link token for bank verification.
+
+**Request:**
+#+begin_src http
+POST /accounts/550e8400-e29b-41d4-a716-446655440000/bank/link-token HTTP/1.1
+Host: wallet-service.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+
+{
+  "redirect_uri": "https://petstore.example/wallet/link-complete"
+}
+#+end_src
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "link_token": "link-sandbox-12345-abcdef",
+  "expiration": "2026-05-09T15:30:00Z"
+}
+#+end_src
+
+**** POST /accounts/{customer_id}/bank/exchange
+
+Exchanges Plaid public token for access token after Link completion.
+
+**Request:**
+#+begin_src http
+POST /accounts/550e8400-e29b-41d4-a716-446655440000/bank/exchange HTTP/1.1
+Host: wallet-service.internal
+Content-Type: application/json
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+Idempotency-Key: plaid-exchange-token123
+
+{
+  "public_token": "public-sandbox-12345-abcdef",
+  "account_id": "account-12345"
+}
+#+end_src
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "bank_account_id": "ba-uuid-123",
+  "institution_name": "Chase",
+  "account_mask": "4567",
+  "account_type": "checking",
+  "verification_status": "verified"
+}
+#+end_src
+
+**** GET /accounts/{customer_id}/bank
+
+Lists verified bank accounts.
+
+**Response (200 OK):**
+#+begin_src json
+{
+  "bank_accounts": [
+    {
+      "id": "ba-uuid-123",
+      "institution_name": "Chase",
+      "account_mask": "4567",
+      "account_type": "checking",
+      "verification_status": "verified",
+      "verified_at": "2026-05-01T10:00:00Z"
+    }
+  ]
+}
+#+end_src
+
+* Trace Propagation
+
+** Payment-Wallet Coordination Flow
+
+#+begin_src mermaid :file wallet-trace-flow.png :eval never-export
+sequenceDiagram
+    participant Order as Order Service
+    participant Payment as Payment Service
+    participant Wallet as Wallet Service
+    participant Postgres as PostgreSQL
+
+    Order->>+Payment: POST /charge (traceparent: 00-abc...-p1-01)
+    Payment->>Payment: Generate child span (00-abc...-p2-01)
+
+    Payment->>+Wallet: GET /balance (traceparent: 00-abc...-p2-01)
+    Wallet->>Postgres: SELECT balance (span: 00-abc...-w1-01)
+    Wallet-->>-Payment: balance: $50
+
+    alt Balance > 0
+        Payment->>+Wallet: POST /apply (traceparent: 00-abc...-p3-01)
+        Wallet->>Postgres: BEGIN (span: 00-abc...-w2-01)
+        Wallet->>Postgres: SELECT FOR UPDATE (lock balance)
+        Wallet->>Postgres: INSERT wallet_transactions (traceparent stored)
+        Wallet->>Postgres: UPDATE wallet_accounts
+        Wallet->>Postgres: COMMIT
+        Wallet-->>-Payment: applied: $50, txn_id
+    end
+
+    Payment->>Payment: Charge remaining via Stripe
+    Payment-->>-Order: {status: success, wallet_applied: $50}
+#+end_src
+
+** traceparent Storage
+
+All wallet transactions store the traceparent in the ledger row. This enables:
+
+1. *End-to-end correlation* — Query transactions by traceparent to find all
+   wallet operations in a payment flow
+2. *Audit trail* — Immutable proof of when and how wallet operations occurred
+3. *Debugging* — Join wallet transactions with payment logs via trace-id
+
+** Query by Trace
+
+#+begin_src sql
+-- Find all wallet transactions in a trace
+SELECT *
+FROM wallet_transactions
+WHERE traceparent LIKE '00-4bf92f3577b34da6a3ce929d0e0e4736-%'
+ORDER BY created_at;
+
+-- Find trace for a specific order
+SELECT DISTINCT substring(traceparent from 4 for 32) as trace_id
+FROM wallet_transactions
+WHERE reference_type = 'order'
+  AND reference_id = 'order-123';
+#+end_src
+
+* Error Handling
+
+** Error Response Format
+
+#+begin_src json
+{
+  "error": {
+    "code": "INSUFFICIENT_BALANCE",
+    "message": "Wallet balance insufficient for requested amount",
+    "details": {
+      "requested": "100.00",
+      "available": "45.00",
+      "currency": "USD"
+    },
+    "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+  }
+}
+#+end_src
+
+** Error Codes
+
+| Code                    | HTTP | Description                          |
+|-------------------------+------+--------------------------------------|
+| INSUFFICIENT_BALANCE    | 422  | Not enough funds in wallet           |
+| GIFT_CARD_EXPIRED       | 422  | Gift card past expiration date       |
+| GIFT_CARD_ALREADY_USED  | 409  | Gift card redeemed by another user   |
+| GIFT_CARD_NOT_FOUND     | 404  | Gift card code not recognized        |
+| IDEMPOTENCY_CONFLICT    | 409  | Key reused with different parameters |
+| WALLET_NOT_FOUND        | 404  | No wallet for customer               |
+| TRANSACTION_NOT_FOUND   | 404  | Referenced transaction not found     |
+| PLAID_ERROR             | 502  | Plaid API error                      |
+| INTERNAL_ERROR          | 500  | Unexpected server error              |
+
+* Configuration
+
+** Environment Variables
+
+| Variable                   | Required | Description                        |
+|----------------------------+----------+------------------------------------|
+| WALLET_DB_URL              | Yes      | PostgreSQL connection string       |
+| WALLET_SERVICE_PORT        | No       | HTTP port (default: 8084)          |
+| PLAID_CLIENT_ID            | Yes      | Plaid API client ID                |
+| PLAID_SECRET               | Yes      | Plaid API secret                   |
+| PLAID_ENV                  | Yes      | sandbox, development, production   |
+| LOYALTY_POINTS_PER_DOLLAR  | No       | Points earned per $1 (default: 1)  |
+| LOYALTY_POINT_VALUE        | No       | $ value per point (default: 0.01)  |
+| GIFT_CARD_PREFIX           | No       | Code prefix (default: GIFT-)       |
+
+** .trace-spine.yaml Integration
+
+#+begin_src yaml
+services:
+  wallet:
+    substrate: http
+    propagation:
+      inject: ["traceparent", "tracestate"]
+      extract: ["traceparent", "tracestate"]
+    storage:
+      outbox: false  # Wallet doesn't publish events
+      ledger:
+        table: wallet_transactions
+        traceparent_column: traceparent
+#+end_src
+
+* Cross-References
+
+- [[file:../../payments/docs/api.org][Payment Service API]] — Primary consumer
+- [[file:../../../spec/L1-wire.org][L1 Wire Format]] — traceparent format
+- [[file:../../../docs/architecture/c4/system-landscape.org][C4 System Landscape]] — Container diagram
+- ADR-0003: Wallet-Payment Integration (TBD)
+
+* Local Variables                                                  :noexport:
+# Local Variables:
+# org-confirm-babel-evaluate: nil
+# End:

@@ -1,0 +1,192 @@
+# CI Workflow for trace-spine
+# Runs on pull requests and pushes to main
+#
+# Jobs:
+# - lint: clj-kondo for Clojure, org-lint for org-mode docs
+# - test: Run tests for all services
+# - c4-check: Validate C4 architecture diagrams
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CLOJURE_VERSION: "1.12.0"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+          clj-kondo: "latest"
+
+      - name: Cache Clojure deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.clojure/.cpcache
+          key: ${{ runner.os }}-clojure-${{ hashFiles('**/deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-clojure-
+
+      - name: Lint Clojure (clj-kondo)
+        run: make clj-lint
+
+      - name: Lint Org files
+        run: make org-lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api
+          - wms
+          - payments
+          - wallet
+          - fraud
+          - metrics
+          - feature-flags
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Cache Clojure deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.clojure/.cpcache
+          key: ${{ runner.os }}-clojure-${{ matrix.service }}-${{ hashFiles(format('platform/{0}/deps.edn', matrix.service)) }}
+          restore-keys: |
+            ${{ runner.os }}-clojure-${{ matrix.service }}-
+            ${{ runner.os }}-clojure-
+
+      - name: Run tests for ${{ matrix.service }}
+        run: make -C platform/${{ matrix.service }} test
+
+  c4-check:
+    name: C4 Diagrams
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (for mermaid-cli)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install mermaid-cli
+        run: npm install -g @mermaid-js/mermaid-cli
+
+      - name: Validate C4 diagrams
+        run: make c4-check
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        service:
+          - api
+          - wms
+          - payments
+          - wallet
+          - fraud
+          - metrics
+          - feature-flags
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Cache Clojure deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+            ~/.clojure/.cpcache
+          key: ${{ runner.os }}-clojure-${{ matrix.service }}-${{ hashFiles(format('platform/{0}/deps.edn', matrix.service)) }}
+          restore-keys: |
+            ${{ runner.os }}-clojure-${{ matrix.service }}-
+            ${{ runner.os }}-clojure-
+
+      - name: Build ${{ matrix.service }}
+        run: make -C platform/${{ matrix.service }} build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.service }}-jar
+          path: platform/${{ matrix.service }}/target/*.jar
+          retention-days: 7
+
+  all-checks:
+    name: All Checks Passed
+    runs-on: ubuntu-latest
+    needs: [lint, test, c4-check]
+    if: always()
+    steps:
+      - name: Check results
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]]; then
+            echo "Lint failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "Tests failed"
+            exit 1
+          fi
+          if [[ "${{ needs.c4-check.result }}" != "success" ]]; then
+            echo "C4 check failed"
+            exit 1
+          fi
+          echo "All checks passed!"

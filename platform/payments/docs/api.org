@@ -1,0 +1,565 @@
+#+title: Payment Service API Specification
+#+author: trace-spine team
+#+date: 2026-05-09
+#+property: header-args :mkdirp t
+#+options: toc:3 num:t
+
+* Overview
+
+The Payment Service orchestrates payment processing for the Petstore Commerce Platform.
+It coordinates between payment processors (Stripe, PayPal), the Wallet Service (store credit),
+and the Fraud Service (pre-authorization risk scoring).
+
+** Core Responsibilities
+
+1. Payment orchestration across multiple processors
+2. Idempotency key handling to prevent duplicate charges
+3. Retry with exponential backoff for transient failures
+4. Circuit breaker patterns for processor outages
+5. Transactional outbox for reliable event publishing
+6. Trace context propagation through all payment flows
+
+** Trace Propagation Contract
+
+All payment flows MUST preserve trace-id across:
+- Incoming HTTP requests from Order Service
+- Outbound HTTP calls to Stripe/PayPal
+- Outbound HTTP calls to Wallet Service
+- Outbound HTTP calls to Fraud Service
+- Outbox events published to Kafka
+
+Every span created by this service MUST be a child of the incoming trace context.
+
+* Payment Orchestration Flows
+
+** Primary Payment Flow
+
+#+begin_src mermaid :file payment-flow.png :eval never-export
+sequenceDiagram
+    participant Order as Order Service
+    participant Pay as Payment Orchestrator
+    participant Idem as Idempotency Layer
+    participant Fraud as Fraud Service
+    participant Wallet as Wallet Service
+    participant Stripe as Stripe Adapter
+    participant Outbox as Outbox Publisher
+
+    Note over Order,Outbox: traceparent: 00-{trace_id}-{parent_span}-01
+
+    Order->>+Pay: POST /charge (idempotency_key, amount, wallet_credit)
+    Pay->>Pay: extract_trace_context(headers)
+    Pay->>Pay: create_child_span("payment.orchestrate")
+
+    Pay->>+Idem: check_idempotency_key(key)
+    Idem-->>-Pay: {status: new|duplicate|in_progress}
+
+    alt duplicate
+        Pay-->>Order: {status: success, charge_id: cached}
+    else in_progress
+        Pay-->>Order: 409 Conflict (retry with backoff)
+    else new
+        Idem->>Idem: mark_in_progress(key)
+
+        Pay->>+Fraud: POST /score (inject traceparent)
+        Fraud-->>-Pay: {risk_score: 0.15, decision: allow}
+
+        alt risk_score > threshold
+            Pay->>Idem: mark_failed(key, "fraud_rejected")
+            Pay-->>Order: {status: declined, reason: fraud}
+        else risk acceptable
+            alt wallet_credit > 0
+                Pay->>+Wallet: POST /apply (inject traceparent)
+                Wallet-->>-Pay: {applied: $50, remaining: $150}
+            end
+
+            Pay->>+Stripe: POST /charges (inject traceparent)
+            Stripe-->>-Pay: {charge_id: ch_xxx, status: success}
+
+            Pay->>+Outbox: record_event(payment.completed, traceparent)
+            Outbox-->>-Pay: {event_id: uuid}
+
+            Pay->>Idem: mark_complete(key, result)
+            Pay-->>-Order: {status: success, charge_id: ch_xxx}
+        end
+    end
+#+end_src
+
+** Partial Payment with Wallet Credit
+
+When an order uses wallet credit, the payment flow splits:
+
+#+begin_src mermaid :file wallet-split.png :eval never-export
+sequenceDiagram
+    participant Pay as Payment Orchestrator
+    participant Wallet as Wallet Service
+    participant Stripe as Stripe Adapter
+
+    Note over Pay: Order: $200, Wallet Credit: $50
+
+    Pay->>Pay: calculate_split(order_amount=200, wallet_credit=50)
+    Note right of Pay: wallet_portion=$50, card_portion=$150
+
+    Pay->>+Wallet: POST /debit {amount: 50, order_id: xxx}
+    Note over Wallet: traceparent: 00-{trace_id}-{child_span_1}-01
+    Wallet-->>-Pay: {debit_id: wd_123, balance_after: $25}
+
+    Pay->>+Stripe: POST /charges {amount: 15000}
+    Note over Stripe: traceparent: 00-{trace_id}-{child_span_2}-01
+    Stripe-->>-Pay: {charge_id: ch_456, status: success}
+
+    alt Stripe fails
+        Pay->>+Wallet: POST /credit {amount: 50, reversal_of: wd_123}
+        Wallet-->>-Pay: {credit_id: wc_789, balance_after: $75}
+        Pay->>Pay: propagate_failure_to_caller
+    end
+#+end_src
+
+* Idempotency Key Handling
+
+** Key Format
+
+#+begin_src text
+{client_id}-{order_id}-{attempt_number}
+#+end_src
+
+Example: ~storefront-ord_12345-1~
+
+** State Machine
+
+#+begin_src mermaid :file idempotency-states.png :eval never-export
+stateDiagram-v2
+    [*] --> new: key_not_found
+    new --> in_progress: lock_acquired
+    in_progress --> complete: payment_success
+    in_progress --> failed: payment_failed
+    complete --> [*]
+    failed --> [*]
+    failed --> in_progress: retry_allowed
+#+end_src
+
+** Database Schema
+
+#+begin_src sql
+CREATE TABLE idempotency_keys (
+    key             VARCHAR(255) PRIMARY KEY,
+    status          VARCHAR(20) NOT NULL DEFAULT 'in_progress',
+    request_hash    VARCHAR(64) NOT NULL,
+    response_body   JSONB,
+    traceparent     VARCHAR(55) NOT NULL,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    expires_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW() + INTERVAL '24 hours'
+);
+
+CREATE INDEX idx_idempotency_expires ON idempotency_keys(expires_at)
+    WHERE status = 'in_progress';
+#+end_src
+
+** Conflict Resolution
+
+| Scenario | Action |
+|----------|--------|
+| Key exists, status=complete | Return cached response |
+| Key exists, status=in_progress, <30s | Return 409 Conflict |
+| Key exists, status=in_progress, >30s | Assume dead lock, retry |
+| Key exists, status=failed, retryable | Allow new attempt |
+| Key exists, request_hash mismatch | Return 422 Unprocessable |
+
+* Retry with Exponential Backoff
+
+** Retry Policy
+
+#+begin_src clojure
+(def retry-policy
+  {:max-attempts 5
+   :initial-delay-ms 100
+   :max-delay-ms 30000
+   :multiplier 2.0
+   :jitter-factor 0.2
+   :retryable-errors #{:network-timeout
+                       :connection-refused
+                       :rate-limited
+                       :service-unavailable}
+   :non-retryable-errors #{:card-declined
+                           :insufficient-funds
+                           :invalid-card
+                           :fraud-detected}})
+#+end_src
+
+** Backoff Calculation
+
+#+begin_src text
+delay = min(max_delay, initial_delay * (multiplier ^ attempt))
+jittered_delay = delay * (1 + random(-jitter_factor, +jitter_factor))
+#+end_src
+
+** Sequence with Backoff
+
+#+begin_src mermaid :file retry-flow.png :eval never-export
+sequenceDiagram
+    participant Pay as Payment Service
+    participant Stripe as Stripe API
+
+    Pay->>+Stripe: POST /charges (attempt 1)
+    Stripe-->>-Pay: 503 Service Unavailable
+
+    Note over Pay: sleep(100ms * 1.0 +/- jitter)
+
+    Pay->>+Stripe: POST /charges (attempt 2)
+    Stripe-->>-Pay: 503 Service Unavailable
+
+    Note over Pay: sleep(100ms * 2.0 +/- jitter)
+
+    Pay->>+Stripe: POST /charges (attempt 3)
+    Stripe-->>-Pay: 200 OK
+
+    Note over Pay: Success! No more retries needed
+#+end_src
+
+** Trace Propagation During Retries
+
+Each retry attempt MUST:
+1. Preserve the original trace-id
+2. Create a new span-id for the retry attempt
+3. Add retry metadata to span attributes
+
+#+begin_src clojure
+;; Example span attributes for retry
+{:retry.attempt 3
+ :retry.reason "service_unavailable"
+ :retry.delay_ms 400}
+#+end_src
+
+* Circuit Breaker Patterns
+
+** Circuit Breaker States
+
+#+begin_src mermaid :file circuit-breaker.png :eval never-export
+stateDiagram-v2
+    [*] --> closed: initial
+    closed --> open: failure_threshold_exceeded
+    open --> half_open: reset_timeout_elapsed
+    half_open --> closed: probe_success
+    half_open --> open: probe_failure
+#+end_src
+
+** Configuration
+
+#+begin_src clojure
+(def circuit-breaker-config
+  {:stripe
+   {:failure-threshold 5
+    :success-threshold 3
+    :reset-timeout-ms 60000
+    :half-open-max-calls 3
+    :slow-call-duration-ms 5000
+    :slow-call-rate-threshold 0.5}
+
+   :paypal
+   {:failure-threshold 5
+    :success-threshold 3
+    :reset-timeout-ms 60000
+    :half-open-max-calls 3
+    :slow-call-duration-ms 8000
+    :slow-call-rate-threshold 0.5}})
+#+end_src
+
+** Failure Detection
+
+| Condition | Counts as Failure |
+|-----------|-------------------|
+| HTTP 5xx response | Yes |
+| Connection timeout | Yes |
+| Read timeout | Yes |
+| HTTP 4xx client error | No |
+| Slow response (>threshold) | Partial (contributes to slow rate) |
+
+** Fallback Behavior
+
+When Stripe circuit is OPEN:
+1. Log circuit state with trace context
+2. If PayPal enabled and PayPal circuit is CLOSED, route to PayPal
+3. If no fallback available, return 503 with Retry-After header
+4. Emit ~circuit.open~ event to outbox (with traceparent)
+
+* Stripe Integration
+
+** API Endpoints Used
+
+| Stripe Endpoint | Purpose |
+|-----------------|---------|
+| POST /v1/charges | Create direct charge |
+| POST /v1/payment_intents | Create payment intent (3DS) |
+| POST /v1/refunds | Process refund |
+| GET /v1/charges/:id | Retrieve charge status |
+
+** Request/Response Mapping
+
+#+begin_src clojure
+;; Internal charge request
+{:amount-cents 15000
+ :currency "usd"
+ :source "tok_visa"
+ :metadata {:order_id "ord_123"
+            :traceparent "00-abc...-def...-01"}}
+
+;; Mapped to Stripe API
+{:amount 15000
+ :currency "usd"
+ :source "tok_visa"
+ :metadata {:order_id "ord_123"
+            :traceparent "00-abc...-def...-01"}
+ :idempotency_key "pay_ord_123_1"}
+#+end_src
+
+** Webhook Processing
+
+Stripe webhooks MUST:
+1. Extract traceparent from ~metadata.traceparent~ if present
+2. Create new trace if no traceparent (webhook is ingress point)
+3. Validate webhook signature before processing
+4. Publish events to outbox with trace context
+
+#+begin_src clojure
+;; Webhook handler
+(defn handle-stripe-webhook [request]
+  (let [event (verify-signature request)
+        traceparent (get-in event [:data :object :metadata :traceparent])
+        ctx (if traceparent
+              (trace-spine/continue traceparent)
+              (trace-spine/start-trace "webhook.stripe"))]
+    (with-trace-context ctx
+      (process-webhook-event event))))
+#+end_src
+
+* PayPal Integration
+
+** API Endpoints Used
+
+| PayPal Endpoint | Purpose |
+|-----------------|---------|
+| POST /v2/checkout/orders | Create order |
+| POST /v2/checkout/orders/:id/capture | Capture payment |
+| POST /v2/payments/captures/:id/refund | Process refund |
+
+** Request/Response Mapping
+
+#+begin_src clojure
+;; Internal charge request
+{:amount-cents 15000
+ :currency "usd"
+ :return-url "https://store.example.com/checkout/confirm"
+ :cancel-url "https://store.example.com/checkout/cancel"
+ :metadata {:order_id "ord_123"
+            :traceparent "00-abc...-def...-01"}}
+
+;; Mapped to PayPal API
+{:intent "CAPTURE"
+ :purchase_units [{:amount {:currency_code "USD"
+                            :value "150.00"}
+                   :custom_id "ord_123"
+                   :description "Order ord_123"}]
+ :application_context {:return_url "..."
+                       :cancel_url "..."}}
+#+end_src
+
+** Trace Propagation Limitation
+
+PayPal does not support custom metadata in the same way as Stripe.
+The traceparent is stored in our database keyed by PayPal order ID.
+
+#+begin_src sql
+CREATE TABLE paypal_trace_context (
+    paypal_order_id VARCHAR(50) PRIMARY KEY,
+    traceparent     VARCHAR(55) NOT NULL,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+#+end_src
+
+* Wallet Credit Application Flow
+
+** Pre-Authorization Check
+
+Before applying wallet credit, verify:
+1. Customer has sufficient balance
+2. Wallet is not frozen/suspended
+3. Order is eligible for wallet payment
+
+** Application Flow
+
+#+begin_src mermaid :file wallet-apply.png :eval never-export
+sequenceDiagram
+    participant Pay as Payment Orchestrator
+    participant Wallet as Wallet Service
+    participant DB as PostgreSQL
+
+    Pay->>+Wallet: GET /balance/{customer_id}
+    Note over Wallet: traceparent: 00-{trace_id}-{span_1}-01
+    Wallet-->>-Pay: {available: 75.00, pending: 0}
+
+    Pay->>Pay: calculate_applicable_credit(order=200, available=75)
+    Note right of Pay: applicable = min(order, available) = 75
+
+    Pay->>+Wallet: POST /debit
+    Note over Wallet: traceparent: 00-{trace_id}-{span_2}-01
+    Wallet->>+DB: BEGIN TRANSACTION
+    DB-->>Wallet: OK
+    Wallet->>DB: UPDATE balance SET amount = amount - 75
+    Wallet->>DB: INSERT INTO transactions (debit, order_id, ...)
+    Wallet->>DB: COMMIT
+    DB-->>-Wallet: OK
+    Wallet-->>-Pay: {debit_id: wd_123, new_balance: 0}
+
+    Note over Pay: Proceed with card charge for remaining $125
+#+end_src
+
+** Compensating Transaction
+
+If the card charge fails after wallet debit:
+
+#+begin_src clojure
+(defn compensate-wallet-debit [ctx debit-id amount order-id]
+  (with-trace-context ctx
+    (let [span (create-child-span "wallet.compensate")]
+      (try
+        (wallet/credit {:debit-id debit-id
+                        :amount amount
+                        :reason :card-charge-failed
+                        :order-id order-id})
+        (finally
+          (close-span span))))))
+#+end_src
+
+* Outbox Publisher
+
+** Event Types
+
+| Event Type | Trigger | Payload |
+|------------|---------|---------|
+| payment.initiated | Charge begins | order_id, amount, processor |
+| payment.completed | Charge succeeds | order_id, charge_id, amount |
+| payment.failed | Charge fails | order_id, error_code, reason |
+| payment.refunded | Refund processed | order_id, refund_id, amount |
+| circuit.opened | Circuit breaker trips | processor, failure_count |
+| circuit.closed | Circuit breaker recovers | processor |
+
+** Outbox Record Structure
+
+#+begin_src sql
+INSERT INTO outbox (
+    id,
+    aggregate_id,
+    event_type,
+    payload,
+    traceparent,
+    tracestate,
+    created_at
+) VALUES (
+    gen_random_uuid(),
+    'ord_12345',
+    'payment.completed',
+    '{"charge_id": "ch_xxx", "amount_cents": 15000, "processor": "stripe"}'::jsonb,
+    '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01',
+    NULL,
+    NOW()
+);
+#+end_src
+
+** Transactional Guarantee
+
+The outbox write MUST be in the same database transaction as the payment record update:
+
+#+begin_src clojure
+(defn complete-payment [ctx payment-id charge-result]
+  (jdbc/with-transaction [tx db-spec]
+    ;; Update payment record
+    (jdbc/execute! tx
+      ["UPDATE payments SET status = 'completed', charge_id = ?, updated_at = NOW()
+        WHERE id = ?"
+       (:charge-id charge-result) payment-id])
+
+    ;; Write to outbox (same transaction)
+    (jdbc/execute! tx
+      ["INSERT INTO outbox (id, aggregate_id, event_type, payload, traceparent)
+        VALUES (?, ?, ?, ?::jsonb, ?)"
+       (random-uuid)
+       payment-id
+       "payment.completed"
+       (json/write-str charge-result)
+       (trace-spine/format-traceparent ctx)])))
+#+end_src
+
+* Error Handling
+
+** Error Categories
+
+| Category | HTTP Status | Retryable | Example |
+|----------|-------------|-----------|---------|
+| Transient | 503 | Yes | Processor timeout |
+| Rate Limited | 429 | Yes (with backoff) | Too many requests |
+| Client Error | 4xx | No | Invalid card |
+| Fraud | 402 | No | Risk score exceeded |
+| System | 500 | Depends | Internal error |
+
+** Error Response Format
+
+#+begin_src json
+{
+  "error": {
+    "code": "payment_failed",
+    "message": "Card was declined",
+    "details": {
+      "decline_code": "insufficient_funds",
+      "processor": "stripe"
+    },
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+    "request_id": "req_abc123"
+  }
+}
+#+end_src
+
+* Observability
+
+** Required Spans
+
+| Span Name | Type | Parent |
+|-----------|------|--------|
+| payment.orchestrate | SERVER | incoming request |
+| payment.idempotency_check | INTERNAL | orchestrate |
+| payment.fraud_check | CLIENT | orchestrate |
+| payment.wallet_apply | CLIENT | orchestrate |
+| payment.charge | CLIENT | orchestrate |
+| payment.outbox_publish | INTERNAL | orchestrate |
+
+** Required Metrics
+
+| Metric | Type | Labels |
+|--------|------|--------|
+| payment_requests_total | Counter | status, processor |
+| payment_duration_seconds | Histogram | processor |
+| payment_amount_cents | Histogram | processor, currency |
+| circuit_breaker_state | Gauge | processor |
+| retry_attempts_total | Counter | processor, outcome |
+| idempotency_cache_hits | Counter | - |
+
+** Required Logs
+
+All logs MUST include:
+- ~trace_id~ from current context
+- ~span_id~ from current span
+- ~payment_id~ when available
+- ~processor~ when processor-specific
+
+* Cross-References
+
+- C4 Component Diagram: [[file:../../../docs/architecture/c4/system-landscape.org::*Payment Service Components]]
+- L1 Wire Format: [[file:../../../spec/L1-wire.org]]
+- L1 Contracts: [[file:../../../spec/L1-contracts.org]]
+- Wallet Service API: [[file:../../wallet/docs/api.org]]
+- Fraud Service API: [[file:../../fraud/docs/api.org]]
+
+#+begin_src text :tangle no
+Local Variables:
+org-confirm-babel-evaluate: nil
+End:
+#+end_src
