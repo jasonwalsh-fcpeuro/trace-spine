@@ -88,4 +88,4 @@ help:
 	@echo "Usage: make [target]"
 	@echo ""
 	@echo "Targets:"
-	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## /  /' | column -t -s ':'
+	@grep -E '^## ' Makefile | sed 's/## //' | awk -F: '{printf "  %-16s %s\n", $$1, $$2}'

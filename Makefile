@@ -180,7 +180,7 @@ help:
 	@echo "  make [target]"
 	@echo ""
 	@echo "$(BOLD)Main Targets:$(RESET)"
-	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## /  /' | column -t -s ':'
+	@grep -E '^## ' Makefile | sed 's/## //' | awk -F: '{printf "  %-16s %s\n", $$1, $$2}'
 	@echo ""
 	@echo "$(BOLD)Services:$(RESET)"
 	@echo "  $(SERVICES)"
