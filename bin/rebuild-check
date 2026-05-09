@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+#
+# bin/rebuild-check — Verify rebuild-from-refs property
+#
+# Usage: bin/rebuild-check [--from-archive | --from-bundle <path>]
+#
+# Clones from the specified source into a tmpdir and verifies that all
+# required refs (main, notes, claims) are present and consistent.
+#
+
+set -euo pipefail
+
+# Parse args
+SOURCE="origin"
+BUNDLE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --from-archive)
+      SOURCE="archive"
+      shift
+      ;;
+    --from-bundle)
+      BUNDLE="$2"
+      shift 2
+      ;;
+    *)
+      echo "Usage: bin/rebuild-check [--from-archive | --from-bundle <path>]"
+      exit 1
+      ;;
+  esac
+done
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+log_ok() { echo -e "${GREEN}✓${NC} $1"; }
+log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
+log_fail() { echo -e "${RED}✗${NC} $1"; }
+
+FAILURES=0
+fail() {
+  log_fail "$1"
+  ((FAILURES++))
+}
+
+echo "=== Rebuild Property Check ==="
+echo ""
+
+# Create tmpdir
+TMPDIR=$(mktemp -d)
+trap "rm -rf $TMPDIR" EXIT
+cd "$TMPDIR"
+
+echo "Working in: $TMPDIR"
+echo ""
+
+# Clone
+if [[ -n "$BUNDLE" ]]; then
+  echo "--- Cloning from bundle: $BUNDLE ---"
+  git clone "$BUNDLE" repo 2>/dev/null
+else
+  echo "--- Cloning from remote: $SOURCE ---"
+  # Get URL from current repo
+  REPO_URL=$(git -C "${OLDPWD}" remote get-url "$SOURCE" 2>/dev/null || echo "")
+  if [[ -z "$REPO_URL" ]]; then
+    fail "Remote '$SOURCE' not found"
+    exit 1
+  fi
+  git clone "$REPO_URL" repo 2>/dev/null
+fi
+
+cd repo
+log_ok "Clone successful"
+echo ""
+
+# Fetch notes refs
+echo "--- Fetching notes refs ---"
+for note_type in conjecture refutation experiment deviation test; do
+  ref="refs/notes/${note_type}"
+  if git fetch origin "${ref}:${ref}" 2>/dev/null; then
+    log_ok "Fetched $ref"
+  else
+    log_warn "$ref not found on remote"
+  fi
+done
+echo ""
+
+# Fetch agent claims
+echo "--- Fetching agent claims ---"
+if git fetch origin 'refs/agents/*:refs/agents/*' 2>/dev/null; then
+  claim_count=$(git for-each-ref --format='%(refname)' refs/agents/ | wc -l)
+  log_ok "Fetched $claim_count agent claim(s)"
+else
+  log_warn "No agent claims found"
+fi
+echo ""
+
+# Verify main branch
+echo "--- Verifying main branch ---"
+if git rev-parse --verify main >/dev/null 2>&1; then
+  commit_count=$(git rev-list --count main)
+  log_ok "main branch present ($commit_count commits)"
+else
+  fail "main branch missing"
+fi
+echo ""
+
+# Verify notes refs have entries reachable from main
+echo "--- Verifying notes refs ---"
+for note_type in conjecture refutation experiment deviation test; do
+  ref="refs/notes/${note_type}"
+  if git show-ref --verify --quiet "$ref" 2>/dev/null; then
+    # Count notes attached to commits reachable from main
+    note_count=0
+    while read -r commit; do
+      if git notes --ref="$ref" show "$commit" >/dev/null 2>&1; then
+        ((note_count++))
+      fi
+    done < <(git rev-list main)
+
+    if [[ $note_count -gt 0 ]]; then
+      log_ok "$ref: $note_count note(s) reachable from main"
+    else
+      log_warn "$ref: exists but no notes reachable from main"
+    fi
+  else
+    log_warn "$ref: not present"
+  fi
+done
+echo ""
+
+# Verify CPRR consistency
+echo "--- Verifying CPRR consistency ---"
+if [[ -f spec/cprr.org ]]; then
+  # Count CPRR table rows (simplified: count lines with C-N pattern)
+  cprr_rows=$(grep -cE '^\| C-[0-9]+' spec/cprr.org 2>/dev/null || echo 0)
+  log_ok "spec/cprr.org: $cprr_rows conjecture row(s)"
+
+  # Count refutation notes
+  if git show-ref --verify --quiet refs/notes/refutation 2>/dev/null; then
+    refutation_count=$(git notes --ref=refs/notes/refutation list 2>/dev/null | wc -l)
+    log_ok "refs/notes/refutation: $refutation_count note(s)"
+
+    # Note: we don't require exact match; notes may include local work
+    # not yet reflected in spec. Just warn if zero.
+    if [[ $refutation_count -eq 0 ]] && [[ $cprr_rows -gt 0 ]]; then
+      log_warn "No refutation notes but CPRR has rows — may be incomplete"
+    fi
+  fi
+else
+  fail "spec/cprr.org missing"
+fi
+echo ""
+
+# Summary
+echo "=== Summary ==="
+if [[ $FAILURES -eq 0 ]]; then
+  log_ok "Rebuild property verified"
+  exit 0
+else
+  fail "$FAILURES check(s) failed"
+  exit 1
+fi

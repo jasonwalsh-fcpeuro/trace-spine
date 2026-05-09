@@ -1,0 +1,93 @@
+# Runbook: Spine Broken in Service X
+# Triggered when a service fails to propagate traceparent
+
+[metadata]
+id = "rb-001"
+title = "Spine Broken in Service X"
+severity = "high"
+conjectures = ["C-1", "C-2"]
+last_updated = "2026-05-09"
+
+[symptoms]
+description = """
+Service X is emitting outbound calls without traceparent header.
+Detected by:
+- Conformance harness failure in CI
+- Central collector showing disconnected spans
+- Downstream service logs showing missing trace context
+"""
+
+indicators = [
+    "CI: conformance harness exit code != 0",
+    "Collector: spans with no parent in non-root position",
+    "Logs: 'missing traceparent' warnings from downstream services"
+]
+
+[diagnosis]
+steps = [
+    "Identify the service from CI output or collector query",
+    "Check .trace-spine.yaml exists and is valid",
+    "Verify middleware is installed in service bootstrap",
+    "Check if recent code change bypassed middleware",
+    "Review outbound HTTP client configuration"
+]
+
+queries = """
+# Find orphan spans (non-root without parent)
+SELECT span_id, trace_id, service_name
+FROM spans
+WHERE parent_span_id IS NOT NULL
+  AND parent_span_id NOT IN (SELECT span_id FROM spans)
+ORDER BY start_time DESC
+LIMIT 20;
+"""
+
+[remediation]
+steps = [
+    "If middleware missing: add trace-spine middleware to service",
+    "If client bypassing: wrap outbound client with trace-spine inject",
+    "If config wrong: fix .trace-spine.yaml and re-run harness",
+    "If adapter bug: file issue in trace-spine repo, tag spine-engineer"
+]
+
+verification = """
+1. Run conformance harness locally: cd conformance && ./run.sh
+2. Verify all properties pass
+3. Check CI passes
+4. Monitor collector for 15 minutes post-deploy
+"""
+
+[escalation]
+primary = "spine-engineer"
+secondary = "spec-keeper"
+cross_team = "otel-local (if collector-side issue suspected)"
+
+[postmortem]
+required_fields = [
+    "Root cause (middleware missing / bypassed client / config error)",
+    "Detection method (CI / production / manual)",
+    "Time to detect",
+    "C-5 update needed? (did harness catch it?)"
+]
+
+template = """
+## Incident: Spine broken in {service}
+
+**Date:** {date}
+**Duration:** {duration}
+**Severity:** {severity}
+
+### Timeline
+- {timeline}
+
+### Root Cause
+{root_cause}
+
+### Remediation
+{remediation}
+
+### C-5 Update
+Did the conformance harness catch this?
+- [ ] Yes → No action
+- [ ] No → Add regression property to harness
+"""

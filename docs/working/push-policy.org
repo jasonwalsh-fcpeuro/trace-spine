@@ -1,0 +1,138 @@
+#+title: Push Discipline
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:2 num:nil
+
+* Overview
+
+Explicit push discipline ensures all refs (branches, notes, claims) are pushed
+in correct order to both origin and archive remotes. Never rely on ~push.default~.
+
+* Push Order
+
+1. Branch refs (current work)
+2. ~refs/notes/*~ (reasoning history)
+3. ~refs/agents/*~ (work claims)
+
+This order ensures the commit exists before notes reference it, and notes exist
+before claims that depend on the reasoning.
+
+* Dual Remote
+
+Two remotes for durability:
+
+| Remote  | Purpose                    | Default location                              |
+|---------|----------------------------|-----------------------------------------------|
+| origin  | Primary collaboration      | GitHub: github.com/aygp-dr/trace-spine        |
+| archive | Local/backup durability    | ~/ghq/mirror/aygp-dr/trace-spine.git          |
+
+Archive location is configurable via ~TRACE_SPINE_ARCHIVE~ environment variable.
+
+* bin/push-all
+
+The ~bin/push-all~ script pushes to both remotes with explicit refspecs:
+
+#+begin_src bash
+bin/push-all
+#+end_src
+
+What it does:
+1. Pushes current branch to origin
+2. Pushes all five notes refs to origin
+3. Pushes all agent claim refs to origin
+4. Repeats for archive remote
+5. Reports success/failure for each
+
+* Setting Up Archive Remote
+
+#+begin_src bash
+# Create bare archive repo
+mkdir -p ~/ghq/mirror/aygp-dr
+git clone --bare . ~/ghq/mirror/aygp-dr/trace-spine.git
+
+# Add as remote
+git remote add archive ~/ghq/mirror/aygp-dr/trace-spine.git
+
+# Or use custom location
+export TRACE_SPINE_ARCHIVE=/path/to/archive.git
+git remote add archive "$TRACE_SPINE_ARCHIVE"
+#+end_src
+
+* Explicit Refspecs
+
+Never use ~git push~ without explicit refs:
+
+#+begin_src bash
+# GOOD: explicit refspecs
+git push origin main
+git push origin refs/notes/conjecture
+git push origin refs/agents/claude-01hz3qkxf8/claim/clj-adapter
+
+# BAD: relies on push.default
+git push
+git push origin
+#+end_src
+
+* Notes Push
+
+#+begin_src bash
+# Push all five notes refs
+for ref in conjecture refutation experiment deviation test; do
+  git push origin refs/notes/${ref}:refs/notes/${ref}
+done
+#+end_src
+
+* Claims Push
+
+#+begin_src bash
+# Push all agent claims
+git push origin 'refs/agents/*:refs/agents/*'
+#+end_src
+
+* Bundle Suggestion (Not Implemented)
+
+For additional durability, a nightly bundle captures all refs:
+
+#+begin_src bash
+# Suggested cron job (not implemented in phase 1)
+# 0 3 * * * /path/to/trace-spine/bin/bundle-nightly
+
+DATE=$(date +%Y-%m-%d)
+BUNDLE_DIR=~/.local/share/trace-spine/bundles
+mkdir -p "$BUNDLE_DIR"
+
+git bundle create "${BUNDLE_DIR}/${DATE}.bundle" \
+  --all \
+  refs/notes/* \
+  refs/agents/*
+
+# Prune old bundles (keep 30 days)
+find "$BUNDLE_DIR" -name '*.bundle' -mtime +30 -delete
+#+end_src
+
+This is a suggestion for future implementation; the property it provides is
+tested by ~bin/rebuild-check~.
+
+* Verification
+
+After ~bin/push-all~, verify:
+
+#+begin_src bash
+# Check branch is up to date
+git status
+
+# Check notes refs exist on remote
+git ls-remote origin 'refs/notes/*'
+
+# Check claims exist on remote
+git ls-remote origin 'refs/agents/*'
+
+# Check archive is synced
+git ls-remote archive 'refs/heads/*'
+#+end_src
+
+* Cross-references
+
+- ADR-0009: Dual-remote push policy
+- bin/push-all: Implementation
+- docs/working/rebuild.org: Property that push enables

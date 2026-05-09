@@ -1,0 +1,33 @@
+# Example .trace-spine.yaml for a checkout service
+version: 1
+service_name: checkout
+ingress_designated: false
+
+crossings:
+  http_inbound:
+    - path: /api/checkout
+      framework: rails
+    - path: /api/cart
+      framework: rails
+
+  http_outbound:
+    - target: payments
+    - target: inventory
+
+  kafka_produce:
+    - topic: b.events.v1
+
+  kafka_consume:
+    - topic: a.events.v1
+      group: checkout-consumer
+
+  outbox:
+    - table: checkout.outbox
+
+  aq_publish:
+    - channel: notifications
+
+budget:
+  propagation_p99_us: 50
+
+exemptions: []

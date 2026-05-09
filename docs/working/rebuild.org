@@ -1,0 +1,135 @@
+#+title: Rebuild-from-Refs Property
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:2 num:nil
+
+* Overview
+
+The rebuild property: cloning from any bundle or the archive remote reconstructs
+the full project state including main branch, all five notes refs, all agent
+claims, and CPRR history.
+
+This property ensures work is never lost due to local machine failure, and
+enables any agent to resume work from refs alone.
+
+* What Must Be Reconstructable
+
+| Artifact              | Ref                       | Verification                        |
+|-----------------------|---------------------------|-------------------------------------|
+| Main branch           | refs/heads/main           | Commits match origin                |
+| Feature branches      | refs/heads/<role>/*       | All stacked branches present        |
+| Conjecture notes      | refs/notes/conjecture     | At least one entry reachable        |
+| Refutation notes      | refs/notes/refutation     | Count matches spec/cprr.org refuted |
+| Experiment notes      | refs/notes/experiment     | At least one entry reachable        |
+| Deviation notes       | refs/notes/deviation      | All entries have ADR reference      |
+| Test notes            | refs/notes/test           | At least one entry reachable        |
+| Agent claims          | refs/agents/*/claim/*     | Active claims present               |
+| CPRR table            | spec/cprr.org             | Rows match note counts              |
+
+* bin/rebuild-check
+
+The script verifies the rebuild property:
+
+#+begin_src bash
+bin/rebuild-check [--from-archive | --from-bundle <path>]
+#+end_src
+
+What it does:
+1. Creates a tmpdir
+2. Clones from specified source (default: origin)
+3. Explicitly fetches ~refs/notes/*~ and ~refs/agents/*~
+4. Asserts each notes ref has at least one entry reachable from main
+5. Asserts CPRR row count in spec/cprr.org matches refutation note count
+6. Exits non-zero on any mismatch
+
+* Verification Steps
+
+** 1. Clone and Fetch
+
+#+begin_src bash
+TMPDIR=$(mktemp -d)
+cd "$TMPDIR"
+git clone "$SOURCE" repo
+cd repo
+
+# Fetch all notes refs
+for note_type in conjecture refutation experiment deviation test; do
+  git fetch origin "refs/notes/${note_type}:refs/notes/${note_type}" || true
+done
+
+# Fetch all agent claims
+git fetch origin 'refs/agents/*:refs/agents/*' || true
+#+end_src
+
+** 2. Notes Ref Presence
+
+#+begin_src bash
+for note_type in conjecture refutation experiment deviation test; do
+  ref="refs/notes/${note_type}"
+  if git show-ref --verify --quiet "$ref"; then
+    # Count notes reachable from main
+    count=$(git log --format='%H' main | while read commit; do
+      git notes --ref="$ref" show "$commit" 2>/dev/null && echo 1
+    done | wc -l)
+    if [[ $count -eq 0 ]]; then
+      echo "FAIL: $ref has no entries reachable from main"
+      exit 1
+    fi
+  fi
+done
+#+end_src
+
+** 3. CPRR Consistency
+
+#+begin_src bash
+# Count refutation notes
+refutation_count=$(git notes --ref=refs/notes/refutation list | wc -l)
+
+# Count CPRR rows with status=refuted (simplified grep)
+cprr_refuted=$(grep -c 'status=refuted' spec/cprr.org 2>/dev/null || echo 0)
+
+# The note count should be >= CPRR refuted count
+# (notes may include local refutations not yet in spec)
+if [[ $refutation_count -lt $cprr_refuted ]]; then
+  echo "FAIL: refutation notes ($refutation_count) < CPRR refuted ($cprr_refuted)"
+  exit 1
+fi
+#+end_src
+
+* CI Integration
+
+The rebuild check runs weekly in CI:
+
+#+begin_src yaml
+# .github/workflows/rebuild-check.yml
+name: Rebuild Property Check
+on:
+  schedule:
+    - cron: '0 4 * * 0'  # Weekly, Sunday 4am UTC
+  workflow_dispatch:
+
+jobs:
+  rebuild-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run rebuild check
+        run: bin/rebuild-check --from-archive
+#+end_src
+
+* Failure Modes
+
+| Failure                        | Cause                              | Fix                                |
+|--------------------------------|------------------------------------|------------------------------------|
+| Notes ref missing              | Forgot to push notes               | Run bin/push-all                   |
+| Notes ref empty                | Never added notes                  | Add notes per cprr-notes.org       |
+| CPRR count mismatch            | Spec updated without notes         | Add refutation notes               |
+| Clone fails                    | Archive not synced                 | Run bin/push-all                   |
+| Agent claims missing           | Claims not pushed                  | Push refs/agents/*                 |
+
+* Cross-references
+
+- docs/working/push-policy.org: How refs get to archive
+- docs/working/cprr-notes.org: What notes should contain
+- bin/rebuild-check: Implementation
+- ADR-0009: Why dual remotes

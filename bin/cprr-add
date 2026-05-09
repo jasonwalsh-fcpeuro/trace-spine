@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+#
+# bin/cprr-add — Add CPRR notes to git
+#
+# Usage:
+#   bin/cprr-add conjecture --commit <sha> --statement "..." --refutation "..."
+#   bin/cprr-add refutation --commit <sha> --conjecture-id <id> --evidence "..."
+#   bin/cprr-add experiment --commit <sha> --command "..." [--seed N]
+#   bin/cprr-add deviation --commit <sha> --spec-section "..." --deviation "..." --justification "..." --refutation "..."
+#   bin/cprr-add test --commit <sha> --property <name> --seed N --status pass|fail
+#
+
+set -euo pipefail
+
+# Generate timestamp
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Get or generate trace ID
+TRACE_ID="${TRACE_SPINE_TRACE_ID:-$(command -v ulid >/dev/null && ulid || date +%s | sha256sum | head -c 26 | tr '[:lower:]' '[:upper:]')}"
+
+usage() {
+  cat <<EOF
+Usage: bin/cprr-add <type> --commit <sha> [options...]
+
+Types:
+  conjecture  Add a conjecture note
+  refutation  Add a refutation note
+  experiment  Add an experiment note
+  deviation   Add a deviation note
+  test        Add a test note
+
+Common options:
+  --commit <sha>    Commit to attach note to (required)
+
+Type-specific options:
+  conjecture:
+    --statement <text>       Conjecture statement (required)
+    --refutation <text>      Refutation condition (required)
+    --cprr-ref <C-N>         Reference to spec/cprr.org row
+    --id <id>                Local conjecture ID (default: auto-generated)
+
+  refutation:
+    --conjecture-id <id>     ID of conjecture being refuted (required)
+    --evidence <text>        Falsifying evidence (required)
+    --counterexample <text>  Specific counterexample
+    --refinement <text>      Proposed fix
+
+  experiment:
+    --command <cmd>          Command executed (required)
+    --seed <N>               Random seed
+    --exit-code <N>          Exit code (default: captured)
+
+  deviation:
+    --spec-section <path>    Spec section deviated from (required)
+    --deviation <text>       What the deviation is (required)
+    --justification <text>   Why it's acceptable (required)
+    --refutation <text>      When to revisit (required)
+    --adr-id <ADR-NNNN>      ADR if escalated
+
+  test:
+    --property <name>        Property test name (required)
+    --seed <N>               Random seed (required)
+    --status <pass|fail>     Outcome (required)
+    --samples <N>            Number of samples
+    --counterexample <text>  Shrunk counterexample if failed
+EOF
+  exit 1
+}
+
+[[ $# -lt 1 ]] && usage
+
+TYPE="$1"
+shift
+
+# Parse common args
+COMMIT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --commit) COMMIT="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+[[ -z "$COMMIT" ]] && { echo "Error: --commit required"; exit 1; }
+
+# Resolve commit to full SHA
+COMMIT=$(git rev-parse "$COMMIT")
+
+case "$TYPE" in
+  conjecture)
+    STATEMENT="" REFUTATION="" CPRR_REF="" ID=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --statement) STATEMENT="$2"; shift 2 ;;
+        --refutation) REFUTATION="$2"; shift 2 ;;
+        --cprr-ref) CPRR_REF="$2"; shift 2 ;;
+        --id) ID="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$STATEMENT" ]] && { echo "Error: --statement required"; exit 1; }
+    [[ -z "$REFUTATION" ]] && { echo "Error: --refutation required"; exit 1; }
+    [[ -z "$ID" ]] && ID="C-local-$(echo "$COMMIT" | head -c 7)"
+
+    JSON=$(cat <<EOF
+{
+  "schema": "cprr-conjecture/v1",
+  "trace_id": "$TRACE_ID",
+  "commit": "$COMMIT",
+  "timestamp": "$TIMESTAMP",
+  "conjecture": {
+    "id": "$ID",
+    "statement": "$STATEMENT",
+    "cprr_ref": ${CPRR_REF:+\"$CPRR_REF\"}${CPRR_REF:-null},
+    "refutation_condition": "$REFUTATION"
+  }
+}
+EOF
+)
+    echo "$JSON" | git notes --ref=refs/notes/conjecture add -f -F - "$COMMIT"
+    echo "Added conjecture note to $COMMIT"
+    ;;
+
+  refutation)
+    CONJ_ID="" EVIDENCE="" COUNTEREXAMPLE="" REFINEMENT="" CPRR_REF=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --conjecture-id) CONJ_ID="$2"; shift 2 ;;
+        --evidence) EVIDENCE="$2"; shift 2 ;;
+        --counterexample) COUNTEREXAMPLE="$2"; shift 2 ;;
+        --refinement) REFINEMENT="$2"; shift 2 ;;
+        --cprr-ref) CPRR_REF="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$CONJ_ID" ]] && { echo "Error: --conjecture-id required"; exit 1; }
+    [[ -z "$EVIDENCE" ]] && { echo "Error: --evidence required"; exit 1; }
+
+    JSON=$(cat <<EOF
+{
+  "schema": "cprr-refutation/v1",
+  "trace_id": "$TRACE_ID",
+  "commit": "$COMMIT",
+  "timestamp": "$TIMESTAMP",
+  "refutation": {
+    "conjecture_id": "$CONJ_ID",
+    "cprr_ref": ${CPRR_REF:+\"$CPRR_REF\"}${CPRR_REF:-null},
+    "evidence": "$EVIDENCE",
+    "counterexample": ${COUNTEREXAMPLE:+\"$COUNTEREXAMPLE\"}${COUNTEREXAMPLE:-null},
+    "refinement": ${REFINEMENT:+\"$REFINEMENT\"}${REFINEMENT:-null}
+  }
+}
+EOF
+)
+    echo "$JSON" | git notes --ref=refs/notes/refutation add -f -F - "$COMMIT"
+    echo "Added refutation note to $COMMIT"
+    ;;
+
+  experiment)
+    COMMAND="" SEED="" EXIT_CODE=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --command) COMMAND="$2"; shift 2 ;;
+        --seed) SEED="$2"; shift 2 ;;
+        --exit-code) EXIT_CODE="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$COMMAND" ]] && { echo "Error: --command required"; exit 1; }
+    [[ -z "$EXIT_CODE" ]] && EXIT_CODE=0
+
+    UNAME=$(uname -a)
+
+    JSON=$(cat <<EOF
+{
+  "schema": "cprr-experiment/v1",
+  "trace_id": "$TRACE_ID",
+  "commit": "$COMMIT",
+  "timestamp": "$TIMESTAMP",
+  "experiment": {
+    "seed": ${SEED:-null},
+    "env": {
+      "uname": "$UNAME"
+    },
+    "command": "$COMMAND",
+    "exit_code": $EXIT_CODE
+  }
+}
+EOF
+)
+    echo "$JSON" | git notes --ref=refs/notes/experiment add -f -F - "$COMMIT"
+    echo "Added experiment note to $COMMIT"
+    ;;
+
+  deviation)
+    SPEC_SECTION="" DEVIATION="" JUSTIFICATION="" REFUTATION="" ADR_ID=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --spec-section) SPEC_SECTION="$2"; shift 2 ;;
+        --deviation) DEVIATION="$2"; shift 2 ;;
+        --justification) JUSTIFICATION="$2"; shift 2 ;;
+        --refutation) REFUTATION="$2"; shift 2 ;;
+        --adr-id) ADR_ID="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$SPEC_SECTION" ]] && { echo "Error: --spec-section required"; exit 1; }
+    [[ -z "$DEVIATION" ]] && { echo "Error: --deviation required"; exit 1; }
+    [[ -z "$JUSTIFICATION" ]] && { echo "Error: --justification required"; exit 1; }
+    [[ -z "$REFUTATION" ]] && { echo "Error: --refutation required"; exit 1; }
+
+    JSON=$(cat <<EOF
+{
+  "schema": "cprr-deviation/v1",
+  "trace_id": "$TRACE_ID",
+  "commit": "$COMMIT",
+  "timestamp": "$TIMESTAMP",
+  "deviation": {
+    "spec_section": "$SPEC_SECTION",
+    "deviation": "$DEVIATION",
+    "justification": "$JUSTIFICATION",
+    "refutation_condition": "$REFUTATION",
+    "adr_id": ${ADR_ID:+\"$ADR_ID\"}${ADR_ID:-null}
+  }
+}
+EOF
+)
+    echo "$JSON" | git notes --ref=refs/notes/deviation add -f -F - "$COMMIT"
+    echo "Added deviation note to $COMMIT"
+    ;;
+
+  test)
+    PROPERTY="" SEED="" STATUS="" SAMPLES="" COUNTEREXAMPLE=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --property) PROPERTY="$2"; shift 2 ;;
+        --seed) SEED="$2"; shift 2 ;;
+        --status) STATUS="$2"; shift 2 ;;
+        --samples) SAMPLES="$2"; shift 2 ;;
+        --counterexample) COUNTEREXAMPLE="$2"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+      esac
+    done
+    [[ -z "$PROPERTY" ]] && { echo "Error: --property required"; exit 1; }
+    [[ -z "$SEED" ]] && { echo "Error: --seed required"; exit 1; }
+    [[ -z "$STATUS" ]] && { echo "Error: --status required"; exit 1; }
+
+    JSON=$(cat <<EOF
+{
+  "schema": "cprr-test/v1",
+  "trace_id": "$TRACE_ID",
+  "commit": "$COMMIT",
+  "timestamp": "$TIMESTAMP",
+  "test": {
+    "property": "$PROPERTY",
+    "seed": $SEED,
+    "samples": ${SAMPLES:-null},
+    "shrunk_counterexample": ${COUNTEREXAMPLE:+\"$COUNTEREXAMPLE\"}${COUNTEREXAMPLE:-null},
+    "status": "$STATUS"
+  }
+}
+EOF
+)
+    echo "$JSON" | git notes --ref=refs/notes/test add -f -F - "$COMMIT"
+    echo "Added test note to $COMMIT"
+    ;;
+
+  *)
+    echo "Unknown type: $TYPE"
+    usage
+    ;;
+esac

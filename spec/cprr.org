@@ -1,0 +1,58 @@
+#+title: CPRR Table — Conjectures
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:nil num:nil
+
+* Overview
+
+CPRR = Conjecture-Prediction-Result-Refutation.
+Each conjecture has an explicit refutation condition and refinement path.
+
+* Conjecture Table
+
+| C-id | Conjecture                                                | Refutation condition                                            | Refinement on refutation                                       |
+|------+-----------------------------------------------------------+-----------------------------------------------------------------+----------------------------------------------------------------|
+| C-1  | Every opted-in service propagates ~traceparent~ on egress | Service emits outbound call without ~traceparent~ in CI fixture | Middleware regression; service removed from opted-in list until fixed |
+| C-2  | Trace id preserved across HTTP→Kafka→aq→outbox→Kafka      | Substrate chain test produces final ctx with different trace id | Adapter at failing crossing rebuilds context; bug filed against adapter |
+| C-3  | No internal service originates trace ids                  | Audit log shows trace id created at non-ingress boundary        | Service's ~continue_or_start~ misconfigured; designate or refactor |
+| C-4  | Propagation overhead p99 < 50µs                           | Bench shows p99 ≥ 50µs for any adapter                          | Profile, optimize hot path; if structural, raise budget with ADR |
+| C-5  | Conformance harness catches every spec violation it claims | Production violation found that harness did not flag            | Add property to harness; CI rerun against history              |
+| C-6  | ~traceparent~ does not leak to user-visible surfaces      | Trace id observed in error response body, public log, or HTML   | Redaction middleware regression; runbook entry for incident class |
+| C-7  | After 24h partition, post-heal reconciliation closes spine | Heal completes and orphan spans remain in central store         | OTel substrate's reconciliation policy (owned by ~otel-local~); cross-team escalation |
+
+* Notes
+
+** C-5: Meta-conjecture
+
+C-5 is the meta-conjecture that the harness catches everything the spec claims.
+The harness can never fully prove this about itself.
+
+Mitigation: every production violation found post-merge MUST add a regression
+property to the harness. The conjecture becomes "harness coverage is monotonically
+increasing in violation history."
+
+** C-7: Cross-team boundary
+
+C-7 sits at the trace-spine/otel-local boundary. Naming it explicitly avoids
+the failure mode where each team assumes the other owns it.
+
+Owner: trace-spine names the conjecture; otel-local owns the reconciliation policy.
+Escalation path: cross-team incident when orphan spans persist post-heal.
+
+* Evidence tracking
+
+Evidence for each conjecture is tracked in ~.beads/~:
+
+#+begin_src bash
+# Create evidence entry
+bd create "C-1 evidence: conformance run 2026-05-09" --tag c-1
+
+# Link to conjecture
+bd update <id> --ref C-1
+#+end_src
+
+* Cross-references
+
+- L0 claims (invariants these conjectures verify): [[file:L0-claims.org]]
+- L2 properties (generative tests): [[file:L2-properties.org]]
+- Runbooks (when conjectures fail): [[file:../runbooks/]]

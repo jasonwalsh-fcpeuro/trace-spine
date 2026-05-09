@@ -1,0 +1,57 @@
+#+title: L0 — Named Claims
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:nil num:nil
+
+* Overview
+
+L0 is the foundation layer: named invariants with explicit refutation conditions.
+Each claim has a unique identifier (I-spine-*) referenced throughout the spec.
+
+* Claims
+
+** I-spine-present
+
+Every wire crossing carries ~traceparent~.
+
+Refutation: a wire crossing is observed (in CI or production) without the header/field.
+
+** I-spine-wellformed
+
+~traceparent~ matches W3C Trace Context syntax, version ~00~.
+
+Refutation: a ~traceparent~ value fails the validation regex.
+
+** I-spine-monotonic
+
+Trace id is preserved across causal-descendant crossings; parent span id chains correctly.
+
+Refutation: two spans in the same causal cone have different trace ids, or a child span's
+parent_id does not match any emitted span_id.
+
+** I-spine-no-fabrication
+
+Ingress without prior trace context generates a new trace id at exactly one designated
+boundary; no internal service originates trace ids.
+
+Refutation: audit log or conformance test shows trace id created at non-ingress boundary.
+
+** I-spine-no-leak
+
+Trace ids do not appear in user-visible logs, response bodies, or error messages
+without redaction policy applied.
+
+Refutation: trace id observed in error response body, public log, or HTML.
+
+** I-spine-budget
+
+Propagation overhead per crossing is bounded (target: < 50µs p99 added by the spine library).
+
+Refutation: bench shows p99 ≥ 50µs for any adapter.
+
+* Cross-references
+
+- L1 wire format: [[file:L1-wire.org]]
+- L1 contracts: [[file:L1-contracts.org]]
+- L2 properties: [[file:L2-properties.org]]
+- CPRR table: [[file:cprr.org]]

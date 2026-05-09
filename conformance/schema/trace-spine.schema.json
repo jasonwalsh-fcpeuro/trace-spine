@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aygp-dr/trace-spine/conformance/schema/trace-spine.schema.json",
+  "title": ".trace-spine.yaml configuration",
+  "description": "Configuration for trace-spine conformance testing",
+  "type": "object",
+  "required": ["version", "service_name"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version"
+    },
+    "service_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Service identifier (lowercase, alphanumeric, hyphens)"
+    },
+    "ingress_designated": {
+      "type": "boolean",
+      "default": false,
+      "description": "True only for edge gateway / ingress boundary"
+    },
+    "crossings": {
+      "type": "object",
+      "description": "Wire crossings this service participates in",
+      "properties": {
+        "http_inbound": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/http_inbound_crossing" }
+        },
+        "http_outbound": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/http_outbound_crossing" }
+        },
+        "kafka_produce": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/kafka_crossing" }
+        },
+        "kafka_consume": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/kafka_consume_crossing" }
+        },
+        "outbox": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/outbox_crossing" }
+        },
+        "aq_publish": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/aq_crossing" }
+        },
+        "aq_subscribe": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/aq_crossing" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "budget": {
+      "type": "object",
+      "description": "Performance budget configuration",
+      "properties": {
+        "propagation_p99_us": {
+          "type": "integer",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Maximum p99 propagation overhead in microseconds"
+        }
+      },
+      "additionalProperties": false
+    },
+    "exemptions": {
+      "type": "array",
+      "description": "Exemptions from standard requirements (each must cite an ADR)",
+      "items": { "$ref": "#/$defs/exemption" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "http_inbound_crossing": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "HTTP path pattern (e.g., /api/checkout)"
+        },
+        "framework": {
+          "type": "string",
+          "enum": ["rails", "ring", "express", "gin", "fastapi"],
+          "description": "Web framework for adapter selection"
+        }
+      },
+      "additionalProperties": false
+    },
+    "http_outbound_crossing": {
+      "type": "object",
+      "required": ["target"],
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Target service name or URL pattern"
+        }
+      },
+      "additionalProperties": false
+    },
+    "kafka_crossing": {
+      "type": "object",
+      "required": ["topic"],
+      "properties": {
+        "topic": {
+          "type": "string",
+          "description": "Kafka topic name"
+        }
+      },
+      "additionalProperties": false
+    },
+    "kafka_consume_crossing": {
+      "type": "object",
+      "required": ["topic", "group"],
+      "properties": {
+        "topic": {
+          "type": "string",
+          "description": "Kafka topic name"
+        },
+        "group": {
+          "type": "string",
+          "description": "Consumer group name"
+        }
+      },
+      "additionalProperties": false
+    },
+    "outbox_crossing": {
+      "type": "object",
+      "required": ["table"],
+      "properties": {
+        "table": {
+          "type": "string",
+          "description": "Fully qualified table name (schema.table)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "aq_crossing": {
+      "type": "object",
+      "required": ["channel"],
+      "properties": {
+        "channel": {
+          "type": "string",
+          "description": "aq channel name"
+        }
+      },
+      "additionalProperties": false
+    },
+    "exemption": {
+      "type": "object",
+      "required": ["adr", "reason"],
+      "properties": {
+        "adr": {
+          "type": "string",
+          "pattern": "^ADR-[0-9]{4}$",
+          "description": "ADR identifier (e.g., ADR-0010)"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Brief explanation of the exemption"
+        },
+        "expires": {
+          "type": "string",
+          "format": "date",
+          "description": "Exemption expiry date (ISO 8601)"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

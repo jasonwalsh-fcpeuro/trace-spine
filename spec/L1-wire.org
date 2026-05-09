@@ -1,0 +1,112 @@
+#+title: L1 — Wire Shape
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:nil num:nil
+
+* Overview
+
+L1 defines the concrete wire format for trace context propagation.
+This is the contract consumers bind against.
+
+* W3C Trace Context, version 00
+
+** Header names
+
+| Substrate      | Header/Field name | Format        | Required |
+|----------------+-------------------+---------------+----------|
+| HTTP           | traceparent       | ASCII string  | Yes      |
+| HTTP           | tracestate        | ASCII string  | No       |
+| Kafka          | traceparent       | UTF-8 bytes   | Yes      |
+| Kafka          | tracestate        | UTF-8 bytes   | No       |
+| aq (NDJSON)    | "traceparent"     | JSON string   | Yes      |
+| aq (NDJSON)    | "tracestate"      | JSON string   | No       |
+| Outbox row     | traceparent       | VARCHAR(55)   | NOT NULL |
+| Outbox row     | tracestate        | TEXT          | NULL     |
+
+** Format
+
+#+begin_src text
+version "-" trace-id "-" parent-id "-" flags
+00-{32 hex}-{16 hex}-{2 hex}
+#+end_src
+
+** Examples
+
+#+begin_src text
+00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00
+#+end_src
+
+** Validation regex
+
+#+begin_src text
+^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$
+#+end_src
+
+** Forbidden values
+
+| Field      | Forbidden value                  | Reason                    |
+|------------+----------------------------------+---------------------------|
+| trace-id   | 00000000000000000000000000000000 | Invalid per W3C spec      |
+| parent-id  | 0000000000000000                 | Invalid per W3C spec      |
+
+** Flags byte
+
+| Bit | Meaning     | Value |
+|-----+-------------+-------|
+|   0 | sampled     | 01    |
+| 1-7 | reserved    | 00    |
+
+* tracestate format
+
+Vendor-specific key-value pairs, comma-separated.
+Each key follows the pattern ~vendor=value~ or ~tenant@vendor=value~.
+
+#+begin_src text
+rojo=00f067aa0ba902b7,congo=t61rcWkgMzE
+#+end_src
+
+Maximum length: 512 bytes.
+
+* Outbox table schema
+
+#+begin_src sql
+CREATE TABLE outbox (
+    id            UUID PRIMARY KEY,
+    aggregate_id  VARCHAR(255) NOT NULL,
+    event_type    VARCHAR(255) NOT NULL,
+    payload       JSONB NOT NULL,
+    traceparent   VARCHAR(55) NOT NULL,
+    tracestate    TEXT,
+    created_at    TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX idx_outbox_created_at ON outbox(created_at);
+#+end_src
+
+* aq envelope schema
+
+#+begin_src json
+{
+  "type": "object",
+  "required": ["traceparent", "payload"],
+  "properties": {
+    "traceparent": {
+      "type": "string",
+      "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
+    },
+    "tracestate": {
+      "type": "string"
+    },
+    "payload": {
+      "type": "object"
+    }
+  }
+}
+#+end_src
+
+* Cross-references
+
+- L0 claims: [[file:L0-claims.org]]
+- L1 contracts: [[file:L1-contracts.org]]
+- ADR-0002: [[file:../docs/architecture/adr/0002-w3c-trace-context-version-00.md]]

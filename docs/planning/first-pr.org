@@ -1,0 +1,117 @@
+#+title: First PR Proposal
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:nil num:nil
+
+* Summary
+
+The first PR establishes the minimal foundation that all other work depends on.
+It ships the wire format spec, the configuration schema, and the ADR substrate.
+
+* Contents
+
+| Path                                         | Purpose                              |
+|----------------------------------------------|--------------------------------------|
+| spec/L1-wire.org                            | Wire format specification            |
+| docs/architecture/adr/0001-record-decisions.md | ADR process                          |
+| docs/architecture/adr/0002-w3c-trace-context-version-00.md | Wire format decision |
+| docs/architecture/adr/index.yml             | ADR index                            |
+| conformance/schema/trace-spine.schema.json  | .trace-spine.yaml JSON Schema        |
+
+* Why this scope
+
+1. **L1-wire.org is the contract** — every adapter binds to it; the conformance
+   harness derives fixtures from it; ADR-0002 cites it.
+
+2. **ADR substrate is required** — exemptions require ADR ids; spec changes
+   require ADR references; establishing the ADR process first avoids retrofitting.
+
+3. **JSON Schema enables validation** — consumer repos can validate their
+   `.trace-spine.yaml` before the harness exists.
+
+4. **Nothing else is needed** — the regex, header names, and format are complete
+   with just these files. No library code, no harness, no integration.
+
+* Explicitly out of scope
+
+| Item                          | Reason                                      |
+|-------------------------------|---------------------------------------------|
+| spec/L0-claims.org            | Foundation but not consumer-facing          |
+| spec/L1-contracts.org         | Required for adapters, not this PR          |
+| spec/L2-properties.org        | Requires harness infrastructure             |
+| spec/cprr.org                 | Depends on L2 for refutation linkage        |
+| ADR-0003, ADR-0004, ADR-0005  | Depend on library/harness work              |
+| lib/*                         | Adapter code comes after spec acceptance    |
+| conformance/harness/          | Requires L2 properties first                |
+| runbooks/                     | Operational, not foundational               |
+| CLAUDE.md, AGENTS.md          | Repo bootstrap, separate commit             |
+
+* Refutation condition (do NOT merge if)
+
+The PR should NOT merge if any of the following are true:
+
+1. **Regex rejects valid W3C traceparent** — the validation regex must accept
+   all examples from the W3C Trace Context spec.
+
+2. **Regex accepts invalid traceparent** — the regex must reject:
+   - trace-id of all zeros
+   - parent-id of all zeros
+   - version other than 00
+   - wrong field lengths
+
+3. **JSON Schema does not validate canonical example** — the schema must
+   validate the example `.trace-spine.yaml` in this PR.
+
+4. **ADR-0002 conflicts with W3C spec** — the ADR must not claim behavior
+   that contradicts the W3C Trace Context recommendation.
+
+5. **spec-keeper has not reviewed** — this PR touches spec/; spec-keeper
+   sign-off is mandatory.
+
+* Validation tests for this PR
+
+#+begin_src bash
+# Regex tests (run locally before PR)
+echo "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" | \
+  grep -E '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+# Should match
+
+echo "00-00000000000000000000000000000000-00f067aa0ba902b7-01" | \
+  grep -E '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+# Should match (regex matches; application logic rejects all-zeros)
+
+echo "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" | \
+  grep -E '^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$'
+# Should NOT match (version 01)
+
+# JSON Schema validation
+npx ajv validate -s conformance/schema/trace-spine.schema.json \
+  -d examples/checkout.trace-spine.yaml
+# Should pass
+#+end_src
+
+* Acceptance checklist
+
+- [ ] spec/L1-wire.org committed with correct regex
+- [ ] ADR-0001 committed
+- [ ] ADR-0002 committed, references L1-wire.org
+- [ ] ADR index.yml includes both ADRs
+- [ ] JSON Schema validates example .trace-spine.yaml
+- [ ] spec-keeper has approved
+- [ ] CI passes (once CI is set up; for first PR, manual validation)
+
+* Commit message template
+
+#+begin_src text
+feat(spec): establish wire format and ADR substrate
+
+- Add spec/L1-wire.org: W3C Trace Context version 00 wire format
+- Add ADR-0001: record architecture decisions
+- Add ADR-0002: W3C Trace Context version 00
+- Add conformance/schema/trace-spine.schema.json
+
+This is the foundational PR. All adapters and the conformance harness
+depend on L1-wire.org. All contract changes require ADR references.
+
+Refs: C-2 (wire format is the contract)
+#+end_src

@@ -1,0 +1,416 @@
+#+title: Phase 1 Acceptance — Task Graph
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:2 num:nil
+
+* Overview
+
+Phase 1 acceptance criteria from the charter:
+
+#+begin_quote
+- Spec L0/L1 committed; L2 has at least seven properties with seeds
+- CPRR table has refutation artifact for C-1 through C-6
+- Conformance harness runs locally and in CI; produces structured report
+- Adapters implemented for: clj, cljs, rb, bb, aq
+- Five test-spec scenarios pass against docker-compose substrate
+- At least three consumer repos have .trace-spine.yaml and CI-gated
+- ADR-0001 through ADR-0005 written and accepted
+- Runbook entries for three named failure modes
+- Cross-team boundary with otel-local named and contact established
+#+end_quote
+
+* Dependency Graph
+
+#+begin_src mermaid :file phase-1-graph.png :eval never-export
+graph TD
+    subgraph Spec["Spec Layer"]
+        L0[L0-claims.org] --> L1W[L1-wire.org]
+        L0 --> L1C[L1-contracts.org]
+        L1W --> L2[L2-properties.org]
+        L1C --> L2
+        L2 --> CPRR[cprr.org]
+    end
+
+    subgraph ADRs["Architecture Decisions"]
+        ADR1[ADR-0001] --> ADR2[ADR-0002]
+        ADR2 --> ADR3[ADR-0003]
+        ADR2 --> ADR4[ADR-0004]
+        ADR2 --> ADR5[ADR-0005]
+    end
+
+    subgraph Schema["Configuration"]
+        L1W --> SCHEMA[.trace-spine.yaml schema]
+    end
+
+    subgraph Harness["Conformance Harness"]
+        L2 --> HARNESS[Harness framework]
+        SCHEMA --> HARNESS
+        HARNESS --> FIXTURES[Fixtures]
+        HARNESS --> SEEDS[Property seeds]
+    end
+
+    subgraph Adapters["Library Adapters"]
+        L1C --> CLJ[clj adapter]
+        L1C --> CLJS[cljs adapter]
+        L1C --> RB[rb adapter]
+        L1C --> BB[bb adapter]
+        L1C --> AQ[aq adapter]
+    end
+
+    subgraph Integration["Integration"]
+        CLJ --> CHAIN[Cross-substrate chain test]
+        HARNESS --> CHAIN
+        CHAIN --> CONSUMER[Consumer repos]
+    end
+
+    subgraph Ops["Operations"]
+        CPRR --> RB1[Runbook: spine-broken]
+        CPRR --> RB2[Runbook: budget-exceeded]
+        CPRR --> RB3[Runbook: trace-leak]
+    end
+
+    ADR5 --> CHAIN
+    CONSUMER --> GATE[CI gate]
+#+end_src
+
+* Task Nodes
+
+** Spec Layer
+
+*** T-01: L0-claims.org
+:PROPERTIES:
+:produces: spec/L0-claims.org
+:depends_on: (none — root)
+:refutes: (foundation for all)
+:owner: spec-keeper
+:size: S
+:status: DONE
+:END:
+
+Named invariants I-spine-present through I-spine-budget.
+Foundation for the entire spec hierarchy.
+
+*** T-02: L1-wire.org
+:PROPERTIES:
+:produces: spec/L1-wire.org
+:depends_on: T-01
+:refutes: C-2 (wire format is the contract)
+:owner: spec-keeper
+:size: S
+:status: DONE
+:END:
+
+W3C Trace Context version 00 wire format specification.
+The contract consumers bind against.
+
+*** T-03: L1-contracts.org
+:PROPERTIES:
+:produces: spec/L1-contracts.org
+:depends_on: T-01
+:refutes: C-1, C-3 (function contracts define behavior)
+:owner: spec-keeper
+:size: M
+:status: DONE
+:END:
+
+Dafny-shaped function contracts for extract/inject/continue_or_start/middleware.
+
+*** T-04: L2-properties.org
+:PROPERTIES:
+:produces: spec/L2-properties.org
+:depends_on: T-02, T-03
+:refutes: C-1 through C-6 (generative refutation)
+:owner: spine-engineer
+:size: M
+:status: DONE
+:END:
+
+Seven property tests: roundtrip, continuation, no_fabrication, monotonic_ids,
+cross_substrate, budget, no_leak.
+
+*** T-05: cprr.org
+:PROPERTIES:
+:produces: spec/cprr.org
+:depends_on: T-04
+:refutes: (tracks all conjectures)
+:owner: spec-keeper
+:size: S
+:status: DONE
+:END:
+
+CPRR table with C-1 through C-7, refutation conditions, refinement paths.
+
+** Architecture Decisions
+
+*** T-06: ADR-0001
+:PROPERTIES:
+:produces: docs/architecture/adr/0001-record-decisions.md
+:depends_on: (none)
+:refutes: (meta — establishes ADR process)
+:owner: spec-keeper
+:size: S
+:status: DONE
+:END:
+
+*** T-07: ADR-0002
+:PROPERTIES:
+:produces: docs/architecture/adr/0002-w3c-trace-context-version-00.md
+:depends_on: T-06, T-02
+:refutes: C-2
+:owner: spec-keeper
+:size: S
+:status: DONE
+:END:
+
+*** T-08: ADR-0003
+:PROPERTIES:
+:produces: docs/architecture/adr/0003-no-internal-origination.md
+:depends_on: T-07
+:refutes: C-3
+:owner: spec-keeper
+:size: S
+:status: DONE
+:END:
+
+*** T-09: ADR-0004
+:PROPERTIES:
+:produces: docs/architecture/adr/0004-50us-propagation-budget.md
+:depends_on: T-07
+:refutes: C-4
+:owner: spec-keeper
+:size: S
+:status: DONE
+:END:
+
+*** T-10: ADR-0005
+:PROPERTIES:
+:produces: docs/architecture/adr/0005-cross-substrate-chain-property.md
+:depends_on: T-07
+:refutes: C-2, C-5
+:owner: spec-keeper
+:size: S
+:status: DONE
+:END:
+
+** Configuration Schema
+
+*** T-11: .trace-spine.yaml JSON Schema
+:PROPERTIES:
+:produces: conformance/schema/trace-spine.schema.json
+:depends_on: T-02
+:refutes: (enables C-1 testing)
+:owner: spine-engineer
+:size: S
+:status: DONE
+:END:
+
+JSON Schema for the `.trace-spine.yaml` configuration file.
+Validates service declarations before harness runs.
+
+** Conformance Harness
+
+*** T-12: Harness framework
+:PROPERTIES:
+:produces: conformance/harness/
+:depends_on: T-04, T-11
+:refutes: C-1, C-2, C-3, C-4, C-5, C-6
+:owner: spine-engineer
+:size: L
+:status: TODO
+:END:
+
+Framework for running conformance tests against services.
+Discovers crossings from .trace-spine.yaml, generates fixtures, runs properties.
+
+*** T-13: Property test seeds
+:PROPERTIES:
+:produces: conformance/seeds/*.edn
+:depends_on: T-12
+:refutes: (enables reproducible failures)
+:owner: spine-engineer
+:size: S
+:status: TODO
+:END:
+
+Initial seeds for property tests. Failure seeds added as regressions.
+
+*** T-14: Fixture captures
+:PROPERTIES:
+:produces: conformance/fixtures/
+:depends_on: T-12
+:refutes: (provides test data for C-2)
+:owner: spine-engineer
+:size: M
+:status: TODO
+:END:
+
+Captured HTTP requests, Kafka messages, aq envelopes for replay testing.
+
+** Library Adapters
+
+*** T-15: Clojure adapter
+:PROPERTIES:
+:produces: lib/clj/
+:depends_on: T-03
+:refutes: C-1, C-2, C-4
+:owner: spine-engineer
+:size: M
+:status: TODO
+:END:
+
+Ring middleware, Kafka hooks, JDBC outbox helper.
+
+*** T-16: ClojureScript adapter
+:PROPERTIES:
+:produces: lib/cljs/
+:depends_on: T-03
+:refutes: C-1, C-2
+:owner: spine-engineer
+:size: M
+:status: TODO
+:END:
+
+Fetch wrapper, re-frame interceptor, websocket helper.
+
+*** T-17: Ruby adapter
+:PROPERTIES:
+:produces: lib/rb/
+:depends_on: T-03
+:refutes: C-1, C-2, C-4
+:owner: spine-engineer
+:size: M
+:status: TODO
+:END:
+
+Rack middleware, ActiveJob/Sidekiq middleware, Kafka hooks.
+
+*** T-18: Babashka adapter
+:PROPERTIES:
+:produces: lib/bb/
+:depends_on: T-03
+:refutes: C-1, C-2
+:owner: spine-engineer
+:size: S
+:status: TODO
+:END:
+
+Shell-out + HTTP for agent runtimes.
+
+*** T-19: aq adapter
+:PROPERTIES:
+:produces: lib/aq/ (or integrated into aq itself)
+:depends_on: T-03
+:refutes: C-1, C-2
+:owner: spine-engineer
+:size: S
+:status: TODO
+:END:
+
+NDJSON envelope helpers, replay-with-context.
+
+** Integration
+
+*** T-20: Cross-substrate chain test
+:PROPERTIES:
+:produces: conformance/chain/
+:depends_on: T-12, T-15, T-10
+:refutes: C-2, C-5
+:owner: spine-engineer
+:size: L
+:status: TODO
+:END:
+
+Docker-compose stack exercising HTTP→Kafka→aq→outbox→Kafka chain.
+
+*** T-21: Consumer repo 1 integration
+:PROPERTIES:
+:produces: (external repo .trace-spine.yaml)
+:depends_on: T-12, T-11
+:refutes: C-1
+:owner: spine-engineer
+:size: S
+:status: TODO
+:END:
+
+*** T-22: Consumer repo 2 integration
+:PROPERTIES:
+:produces: (external repo .trace-spine.yaml)
+:depends_on: T-12, T-11
+:refutes: C-1
+:owner: spine-engineer
+:size: S
+:status: TODO
+:END:
+
+*** T-23: Consumer repo 3 integration
+:PROPERTIES:
+:produces: (external repo .trace-spine.yaml)
+:depends_on: T-12, T-11
+:refutes: C-1
+:owner: spine-engineer
+:size: S
+:status: TODO
+:END:
+
+** Operations
+
+*** T-24: Runbook spine-broken
+:PROPERTIES:
+:produces: runbooks/spine-broken-in-service-X.toml
+:depends_on: T-05
+:refutes: (response for C-1, C-2 failures)
+:owner: spine-engineer
+:size: S
+:status: DONE
+:END:
+
+*** T-25: Runbook budget-exceeded
+:PROPERTIES:
+:produces: runbooks/propagation-budget-exceeded.toml
+:depends_on: T-05
+:refutes: (response for C-4 failures)
+:owner: spine-engineer
+:size: S
+:status: DONE
+:END:
+
+*** T-26: Runbook trace-leak
+:PROPERTIES:
+:produces: runbooks/trace-id-leak-incident.toml
+:depends_on: T-05
+:refutes: (response for C-6 failures)
+:owner: spine-engineer
+:size: S
+:status: DONE
+:END:
+
+** Cross-team
+
+*** T-27: otel-local boundary
+:PROPERTIES:
+:produces: docs/architecture/context-map.dsl (entry)
+:depends_on: T-05
+:refutes: C-7 (boundary ownership)
+:owner: spec-keeper
+:size: S
+:status: TODO
+:END:
+
+Document the trace-spine / otel-local boundary and establish contact.
+
+* Summary
+
+| Category      | Tasks | Done | TODO |
+|---------------|-------|------|------|
+| Spec          | 5     | 5    | 0    |
+| ADRs          | 5     | 5    | 0    |
+| Schema        | 1     | 1    | 0    |
+| Harness       | 3     | 0    | 3    |
+| Adapters      | 5     | 0    | 5    |
+| Integration   | 4     | 0    | 4    |
+| Operations    | 3     | 3    | 0    |
+| Cross-team    | 1     | 0    | 1    |
+|---------------|-------|------|------|
+| **Total**     | 27    | 14   | 13   |
+
+Phase 1 acceptance requires all 27 tasks complete.

@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aygp-dr/trace-spine/schema/notes/experiment.schema.json",
+  "title": "CPRR Experiment Note",
+  "description": "Git note recording a reproducible test run with environment",
+  "type": "object",
+  "required": ["schema", "trace_id", "commit", "timestamp", "experiment"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "cprr-experiment/v1"
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9A-Z]{26}$",
+      "description": "ULID from work session"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "Git commit SHA"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp"
+    },
+    "experiment": {
+      "type": "object",
+      "required": ["env", "command", "exit_code"],
+      "properties": {
+        "seed": {
+          "type": "integer",
+          "description": "Random seed for reproducibility"
+        },
+        "env": {
+          "type": "object",
+          "required": ["uname"],
+          "properties": {
+            "uname": {
+              "type": "string",
+              "description": "Output of uname -a"
+            },
+            "clojure": {
+              "type": "string",
+              "description": "Clojure version"
+            },
+            "java": {
+              "type": "string",
+              "description": "Java version"
+            },
+            "ruby": {
+              "type": "string",
+              "description": "Ruby version"
+            },
+            "go": {
+              "type": "string",
+              "description": "Go version"
+            },
+            "node": {
+              "type": "string",
+              "description": "Node.js version"
+            },
+            "lockfile_sha": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "description": "SHA256 of dependency lockfile"
+            }
+          },
+          "additionalProperties": true
+        },
+        "command": {
+          "type": "string",
+          "description": "Command executed"
+        },
+        "stdout_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "SHA256 of stdout"
+        },
+        "stderr_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "SHA256 of stderr"
+        },
+        "exit_code": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Process exit code"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Execution duration in milliseconds"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

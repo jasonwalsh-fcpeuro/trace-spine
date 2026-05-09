@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aygp-dr/trace-spine/schema/notes/deviation.schema.json",
+  "title": "CPRR Deviation Note",
+  "description": "Git note recording intentional departure from spec",
+  "type": "object",
+  "required": ["schema", "trace_id", "commit", "timestamp", "deviation"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "cprr-deviation/v1"
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9A-Z]{26}$",
+      "description": "ULID from work session"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "Git commit SHA"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp"
+    },
+    "deviation": {
+      "type": "object",
+      "required": ["spec_section", "deviation", "justification", "refutation_condition"],
+      "properties": {
+        "spec_section": {
+          "type": "string",
+          "description": "Spec section being deviated from (e.g., spec/L1-contracts.org#extract)"
+        },
+        "deviation": {
+          "type": "string",
+          "description": "What the deviation is"
+        },
+        "justification": {
+          "type": "string",
+          "description": "Why the deviation is acceptable"
+        },
+        "refutation_condition": {
+          "type": "string",
+          "description": "Under what condition this deviation should be revisited"
+        },
+        "adr_id": {
+          "type": ["string", "null"],
+          "pattern": "^ADR-[0-9]{4}$",
+          "description": "ADR ID if deviation escalated to architectural decision"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

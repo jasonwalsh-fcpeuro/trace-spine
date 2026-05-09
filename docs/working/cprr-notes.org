@@ -1,0 +1,213 @@
+#+title: CPRR-in-Git-Notes Convention
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:2 num:nil
+
+* Overview
+
+CPRR (Conjecture-Prediction-Result-Refutation) is recorded durably in git notes.
+Notes are pushed alongside branches, ensuring reasoning history survives rebases,
+force-pushes, and repository reconstruction.
+
+* Notes Refs
+
+Five notes refs, all pushed to both origin and archive:
+
+| Ref                      | Purpose                                    |
+|--------------------------|--------------------------------------------|
+| refs/notes/conjecture    | Hypotheses about system behavior           |
+| refs/notes/refutation    | Evidence that falsifies a conjecture       |
+| refs/notes/experiment    | Reproducible test runs with environment    |
+| refs/notes/deviation     | Intentional departures from spec           |
+| refs/notes/test          | Property test seeds and counterexamples    |
+
+* JSON Envelope
+
+Each note is a JSON object with a standard envelope:
+
+#+begin_src json
+{
+  "schema": "cprr-<dimension>/v1",
+  "trace_id": "<ULID from work session>",
+  "commit": "<commit SHA this note attaches to>",
+  "timestamp": "<ISO 8601 UTC>",
+  "<dimension>": { ... }
+}
+#+end_src
+
+Schemas are defined in ~schema/notes/~.
+
+* Dimension Schemas
+
+** conjecture
+
+#+begin_src json
+{
+  "schema": "cprr-conjecture/v1",
+  "trace_id": "01HZ3QKXF8J7NWVB5T2M6P4C9R",
+  "commit": "abc123",
+  "timestamp": "2026-05-09T14:30:00Z",
+  "conjecture": {
+    "id": "C-local-001",
+    "statement": "Ring middleware correctly extracts traceparent",
+    "cprr_ref": "C-1",
+    "evidence_required": "Property test passes with 10k samples",
+    "refutation_condition": "Any valid traceparent rejected by extract()"
+  }
+}
+#+end_src
+
+** refutation
+
+#+begin_src json
+{
+  "schema": "cprr-refutation/v1",
+  "trace_id": "01HZ3QKXF8J7NWVB5T2M6P4C9R",
+  "commit": "def456",
+  "timestamp": "2026-05-09T15:45:00Z",
+  "refutation": {
+    "conjecture_id": "C-local-001",
+    "cprr_ref": "C-1",
+    "evidence": "Property test found counterexample with seed 42",
+    "counterexample": "traceparent with uppercase hex rejected",
+    "refinement": "Update regex to accept [0-9a-fA-F]"
+  }
+}
+#+end_src
+
+** experiment
+
+#+begin_src json
+{
+  "schema": "cprr-experiment/v1",
+  "trace_id": "01HZ3QKXF8J7NWVB5T2M6P4C9R",
+  "commit": "789abc",
+  "timestamp": "2026-05-09T16:00:00Z",
+  "experiment": {
+    "seed": 42,
+    "env": {
+      "uname": "FreeBSD 14.3-RELEASE amd64",
+      "clojure": "1.12.0",
+      "java": "21.0.2",
+      "lockfile_sha": "sha256:abc123..."
+    },
+    "command": "clj -M:test -m kaocha.runner",
+    "stdout_digest": "sha256:def456...",
+    "stderr_digest": "sha256:000000...",
+    "exit_code": 0,
+    "duration_ms": 4523
+  }
+}
+#+end_src
+
+** deviation
+
+#+begin_src json
+{
+  "schema": "cprr-deviation/v1",
+  "trace_id": "01HZ3QKXF8J7NWVB5T2M6P4C9R",
+  "commit": "cde789",
+  "timestamp": "2026-05-09T17:00:00Z",
+  "deviation": {
+    "spec_section": "spec/L1-contracts.org#extract",
+    "deviation": "Accept uppercase hex in traceparent for compatibility",
+    "justification": "W3C spec says lowercase SHOULD, not MUST",
+    "refutation_condition": "If interop issue reported, revert to strict",
+    "adr_id": null
+  }
+}
+#+end_src
+
+** test
+
+#+begin_src json
+{
+  "schema": "cprr-test/v1",
+  "trace_id": "01HZ3QKXF8J7NWVB5T2M6P4C9R",
+  "commit": "efg012",
+  "timestamp": "2026-05-09T18:00:00Z",
+  "test": {
+    "property": "roundtrip",
+    "seed": 42,
+    "samples": 10000,
+    "shrunk_counterexample": null,
+    "last_good_seed": 41,
+    "status": "pass"
+  }
+}
+#+end_src
+
+* CLI Wrappers
+
+** bin/cprr-add
+
+#+begin_src bash
+# Add a conjecture note
+bin/cprr-add conjecture --commit HEAD \
+  --statement "Ring middleware extracts traceparent" \
+  --cprr-ref C-1 \
+  --refutation "Property test finds rejected valid traceparent"
+
+# Add an experiment note
+bin/cprr-add experiment --commit HEAD \
+  --seed 42 \
+  --command "clj -M:test"
+
+# Add a refutation note
+bin/cprr-add refutation --commit HEAD \
+  --conjecture-id C-local-001 \
+  --evidence "Counterexample found" \
+  --counterexample "uppercase hex"
+#+end_src
+
+** bin/cprr-show
+
+#+begin_src bash
+# Show all notes for a commit
+bin/cprr-show HEAD
+
+# Show notes of specific type
+bin/cprr-show --type conjecture HEAD
+
+# Show notes across range
+bin/cprr-show --type refutation main..HEAD
+
+# Export to NDJSON
+bin/cprr-show --format ndjson > cprr-export.ndjson
+#+end_src
+
+* Git Commands (Manual)
+
+#+begin_src bash
+# Add a note
+echo '{"schema":"cprr-conjecture/v1",...}' | git notes --ref=refs/notes/conjecture add -F - HEAD
+
+# Show notes for a commit
+git notes --ref=refs/notes/conjecture show HEAD
+
+# List all notes in a ref
+git notes --ref=refs/notes/conjecture list
+
+# Push notes
+git push origin refs/notes/conjecture
+
+# Fetch notes
+git fetch origin refs/notes/conjecture:refs/notes/conjecture
+#+end_src
+
+* Integrity Properties
+
+1. Every commit with a Conjecture: trailer SHOULD have a conjecture note
+2. Every refutation note MUST reference an existing conjecture
+3. Experiment notes MUST have reproducible environment info
+4. Deviation notes MUST have a refutation condition
+
+bin/rebuild-check verifies: count(refutation notes reachable from main) ≥
+count(CPRR rows in spec/cprr.org with status=refuted).
+
+* Cross-references
+
+- ADR-0008: CPRR-in-git-notes as durable reasoning record
+- schema/notes/: JSON Schema definitions
+- bin/cprr-add, bin/cprr-show: CLI wrappers
+- spec/cprr.org: Canonical CPRR table

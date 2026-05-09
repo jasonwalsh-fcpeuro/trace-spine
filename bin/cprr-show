@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# bin/cprr-show — Show CPRR notes from git
+#
+# Usage:
+#   bin/cprr-show [--type <type>] [--format json|pretty|ndjson] <commit-or-range>
+#
+# Examples:
+#   bin/cprr-show HEAD                    # All notes for HEAD
+#   bin/cprr-show --type conjecture HEAD  # Only conjecture notes
+#   bin/cprr-show main..HEAD              # All notes in range
+#   bin/cprr-show --format ndjson main..  # Export as NDJSON
+#
+
+set -euo pipefail
+
+TYPE=""
+FORMAT="pretty"
+RANGE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type)
+      TYPE="$2"
+      shift 2
+      ;;
+    --format)
+      FORMAT="$2"
+      shift 2
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+    *)
+      RANGE="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -z "$RANGE" ]] && RANGE="HEAD"
+
+# Get list of commits
+if [[ "$RANGE" == *..* ]]; then
+  COMMITS=$(git rev-list "$RANGE")
+else
+  COMMITS=$(git rev-parse "$RANGE")
+fi
+
+# Note types to check
+if [[ -n "$TYPE" ]]; then
+  TYPES=("$TYPE")
+else
+  TYPES=(conjecture refutation experiment deviation test)
+fi
+
+# Pretty print a note
+pretty_print() {
+  local note_type="$1"
+  local commit="$2"
+  local content="$3"
+
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "Type:   $note_type"
+  echo "Commit: $(echo "$commit" | head -c 12)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # Parse JSON and pretty print key fields
+  if command -v jq >/dev/null 2>&1; then
+    echo "$content" | jq -r '
+      "Trace-Id: \(.trace_id)",
+      "Timestamp: \(.timestamp)",
+      "",
+      (if .conjecture then
+        "Conjecture ID: \(.conjecture.id)",
+        "Statement: \(.conjecture.statement)",
+        "Refutation: \(.conjecture.refutation_condition)",
+        if .conjecture.cprr_ref then "CPRR Ref: \(.conjecture.cprr_ref)" else empty end
+      elif .refutation then
+        "Refutes: \(.refutation.conjecture_id)",
+        "Evidence: \(.refutation.evidence)",
+        if .refutation.counterexample then "Counterexample: \(.refutation.counterexample)" else empty end,
+        if .refutation.refinement then "Refinement: \(.refutation.refinement)" else empty end
+      elif .experiment then
+        "Command: \(.experiment.command)",
+        "Exit Code: \(.experiment.exit_code)",
+        if .experiment.seed then "Seed: \(.experiment.seed)" else empty end,
+        "Environment: \(.experiment.env.uname)"
+      elif .deviation then
+        "Spec Section: \(.deviation.spec_section)",
+        "Deviation: \(.deviation.deviation)",
+        "Justification: \(.deviation.justification)",
+        "Refutation: \(.deviation.refutation_condition)",
+        if .deviation.adr_id then "ADR: \(.deviation.adr_id)" else empty end
+      elif .test then
+        "Property: \(.test.property)",
+        "Seed: \(.test.seed)",
+        "Status: \(.test.status)",
+        if .test.samples then "Samples: \(.test.samples)" else empty end,
+        if .test.shrunk_counterexample then "Counterexample: \(.test.shrunk_counterexample)" else empty end
+      else
+        empty
+      end)
+    ' 2>/dev/null || echo "$content"
+  else
+    echo "$content"
+  fi
+  echo ""
+}
+
+# Output
+FOUND=0
+for commit in $COMMITS; do
+  for note_type in "${TYPES[@]}"; do
+    ref="refs/notes/${note_type}"
+    if content=$(git notes --ref="$ref" show "$commit" 2>/dev/null); then
+      FOUND=1
+      case "$FORMAT" in
+        pretty)
+          pretty_print "$note_type" "$commit" "$content"
+          ;;
+        json)
+          if command -v jq >/dev/null 2>&1; then
+            echo "$content" | jq --arg type "$note_type" --arg commit "$commit" \
+              '. + {_note_type: $type, _commit: $commit}'
+          else
+            echo "$content"
+          fi
+          ;;
+        ndjson)
+          echo "$content"
+          ;;
+      esac
+    fi
+  done
+done
+
+if [[ $FOUND -eq 0 ]]; then
+  echo "No notes found for: $RANGE"
+  exit 0
+fi

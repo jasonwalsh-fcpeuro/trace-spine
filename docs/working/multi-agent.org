@@ -1,0 +1,151 @@
+#+title: Multi-Agent Work-Claim Protocol
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:2 num:nil
+
+* Overview
+
+When multiple agents work on trace-spine concurrently, they need coordination
+to avoid conflicting changes. This protocol uses git refs as the coordination
+mechanism — pure git, no external dependencies.
+
+aq integration is OUT OF SCOPE for phase 1. See ADR-0006.
+
+* Claim Refs
+
+Before starting work on a topic, an agent creates and pushes a claim ref:
+
+#+begin_src text
+refs/agents/<agent-id>/claim/<topic-slug>
+#+end_src
+
+The ref points at the base commit the agent branches from.
+
+** Agent ID
+
+Format: ~<type>-<session-hash>~
+
+| Type   | Example                        |
+|--------|--------------------------------|
+| human  | human-jwalsh                   |
+| claude | claude-01hz3qkxf8              |
+| ci     | ci-github-actions-12345        |
+
+** Topic Slug
+
+Same as the topic-slug in branch naming (kebab-case, descriptive).
+
+* Workflow
+
+** 1. Check Existing Claims
+
+Before starting work:
+
+#+begin_src bash
+git fetch origin 'refs/agents/*:refs/agents/*'
+git ls-remote origin 'refs/agents/*/claim/*'
+#+end_src
+
+If a claim exists for your intended topic:
+- Choose a different topic, OR
+- Coordinate with the claiming agent, OR
+- If claim is stale (>24h, no PR), request reap from spec-keeper
+
+** 2. Create Claim
+
+#+begin_src bash
+# Generate agent ID (for Claude sessions, use session prefix)
+AGENT_ID="claude-$(ulid | cut -c1-12 | tr '[:upper:]' '[:lower:]')"
+TOPIC="clj-adapter"
+BASE=$(git rev-parse main)
+
+# Create and push claim ref
+git update-ref "refs/agents/${AGENT_ID}/claim/${TOPIC}" "${BASE}"
+git push origin "refs/agents/${AGENT_ID}/claim/${TOPIC}"
+#+end_src
+
+** 3. Work on Branch
+
+Create your stacked branch per docs/working/stacking.org:
+
+#+begin_src bash
+git checkout -b "spine-engineer/${TOPIC}/01" main
+# ... work ...
+git push origin "spine-engineer/${TOPIC}/01"
+#+end_src
+
+** 4. Release Claim
+
+When PR is opened, delete the claim ref:
+
+#+begin_src bash
+git push origin --delete "refs/agents/${AGENT_ID}/claim/${TOPIC}"
+#+end_src
+
+* Collision Detection
+
+If two agents somehow create claims for the same topic pointing at the same
+commit, this is a protocol failure. Current policy: first-push wins.
+
+#+begin_src bash
+# Detect collision (run before starting work)
+TOPIC="clj-adapter"
+CLAIMS=$(git ls-remote origin "refs/agents/*/claim/${TOPIC}" | wc -l)
+if [ "$CLAIMS" -gt 0 ]; then
+  echo "COLLISION: topic ${TOPIC} already claimed"
+  git ls-remote origin "refs/agents/*/claim/${TOPIC}"
+  exit 1
+fi
+#+end_src
+
+If collisions occur twice in a sprint, escalate to ADR-0006 refutation.
+
+* Stale Claim Reaping
+
+Spec-keeper may reap stale claims:
+
+#+begin_src bash
+# List all claims with timestamps
+for ref in $(git for-each-ref --format='%(refname)' refs/agents/*/claim/*); do
+  commit=$(git rev-parse "$ref")
+  date=$(git log -1 --format='%ci' "$commit")
+  echo "$ref -> $commit ($date)"
+done
+
+# Reap a specific stale claim
+git push origin --delete "refs/agents/<agent-id>/claim/<topic>"
+#+end_src
+
+Reaping criteria:
+- No PR opened within 24h of claim creation
+- Agent is known to have terminated (session ended)
+- Spec-keeper judgment call
+
+* Ref Listing Helpers
+
+#+begin_src bash
+# All current claims
+git ls-remote origin 'refs/agents/*/claim/*'
+
+# Claims by a specific agent
+git ls-remote origin 'refs/agents/claude-01hz3qkxf8/claim/*'
+
+# Claims for a specific topic
+git ls-remote origin 'refs/agents/*/claim/clj-adapter'
+#+end_src
+
+* Phase 1 Limitations
+
+- No automatic conflict resolution
+- No lock semantics (claims are advisory)
+- No notification when claims change
+- No integration with aq or other messaging
+
+These are acceptable for phase 1 (small team, low parallelism).
+ADR-0006 captures the deferral and refutation condition.
+
+* Cross-references
+
+- ADR-0006: aq deferred for multi-agent coordination
+- docs/working/stacking.org: Branch naming convention
+- docs/working/push-policy.org: How to push claim refs

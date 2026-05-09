@@ -1,0 +1,155 @@
+#+title: Stacked-Diff Convention
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:2 num:nil
+
+* Overview
+
+This document defines the stacked-diff discipline for trace-spine development.
+The discipline is tool-agnostic; Graphite, git-spr, jj, or hand-rolled stacks
+are all acceptable. What matters is naming, trace-id trailers, and chain integrity.
+
+* Branch Naming
+
+#+begin_src text
+<role>/<topic-slug>/NN
+#+end_src
+
+| Component    | Format               | Example                        |
+|--------------|----------------------|--------------------------------|
+| role         | spec-keeper, spine-engineer, adversary | spine-engineer     |
+| topic-slug   | kebab-case, descriptive | clj-adapter                  |
+| NN           | two-digit sequence   | 01, 02, 03                     |
+
+Examples:
+- ~spine-engineer/clj-adapter/01~
+- ~spine-engineer/clj-adapter/02~
+- ~adversary/chaos-http-drop/01~
+- ~spec-keeper/l2-property-fan-out/01~
+
+* Stack Size
+
+Each branch is one logical change:
+- Target: ≤ ~300 LOC diff
+- If larger, split into additional stack layers
+- Bottom of stack: foundational change
+- Top of stack: completion change
+
+* Commit Message Format
+
+Every commit message MUST include a trailer block:
+
+#+begin_src text
+<type>(<scope>): <description>
+
+<body - optional>
+
+Trace-Id: <ULID>
+Conjecture: <one line: what this commit attempts to support>
+Refutation: <one line: what would falsify it>
+Refs: <spec section, CPRR id, or ADR>
+#+end_src
+
+** Trace-Id
+
+Generated at the start of the work session. All commits in one session share
+the same Trace-Id. Use any ULID generator:
+
+#+begin_src bash
+# Generate ULID (install: cargo install ulid-cli or npm i -g ulid)
+ulid
+# Example: 01HZ3QKXF8J7NWVB5T2M6P4C9R
+#+end_src
+
+** Conjecture
+
+One line stating what this commit attempts to support or prove.
+Example: "Ring middleware correctly extracts traceparent from HTTP headers"
+
+** Refutation
+
+One line stating what would falsify the conjecture.
+Example: "Property test finds a valid traceparent that extract() rejects"
+
+* Stack Chain Integrity
+
+** Bottom of Stack
+
+The bottom branch (NN=01) MUST reference the spec section it refines:
+
+#+begin_src text
+feat(lib/clj): implement extract function
+
+Implements the extract() contract from spec/L1-contracts.org.
+This is the foundation for the Clojure adapter stack.
+
+Trace-Id: 01HZ3QKXF8J7NWVB5T2M6P4C9R
+Conjecture: extract() satisfies L1 contract for HTTP carriers
+Refutation: roundtrip property test fails
+Refs: spec/L1-contracts.org#extract
+#+end_src
+
+** Top of Stack
+
+The top branch MUST reference the acceptance criterion it closes:
+
+#+begin_src text
+feat(lib/clj): complete adapter with middleware
+
+Completes the Clojure adapter. All property tests pass.
+Ready for conformance harness integration.
+
+Trace-Id: 01HZ3QKXF8J7NWVB5T2M6P4C9R
+Conjecture: Clojure adapter satisfies phase-1 acceptance for T-15
+Refutation: conformance harness fails on clj adapter
+Refs: docs/planning/phase-1-graph.org#T-15
+#+end_src
+
+* Merge Policy
+
+- **Rebase-merge only**
+- main has no merge commits
+- Each stack layer lands as a linear sequence of commits
+- Squash within a layer is acceptable before merge
+
+#+begin_src bash
+# Landing a stack (manual)
+git checkout main
+git pull --rebase origin main
+git rebase main spine-engineer/clj-adapter/01
+git push origin main
+
+# Then land 02 on top of updated main
+git rebase main spine-engineer/clj-adapter/02
+git push origin main
+#+end_src
+
+* Tool Integration
+
+The discipline is naming + trace-id + chain integrity. Any tool that preserves
+these properties is acceptable:
+
+| Tool       | Notes                                           |
+|------------|-------------------------------------------------|
+| Graphite   | Use ~gt~ commands; trailers via commit template |
+| git-spr    | Single-commit stacks; trailers via hook         |
+| jj         | Immutable commits; trailers in description      |
+| Hand-rolled | ~git rebase -i~; trailers manually             |
+
+* Validation
+
+Before opening a PR:
+
+#+begin_src bash
+# Check branch name
+git rev-parse --abbrev-ref HEAD | grep -E '^(spec-keeper|spine-engineer|adversary)/[a-z0-9-]+/[0-9]{2}$'
+
+# Check trailers in all commits on branch
+git log main..HEAD --format='%b' | grep -E '^Trace-Id:|^Conjecture:|^Refutation:'
+#+end_src
+
+* Cross-references
+
+- ADR-0007: Stacked-diff discipline as merge policy
+- docs/working/multi-agent.org: Claim coordination between stacks
+- docs/working/cprr-notes.org: Recording conjectures in git notes

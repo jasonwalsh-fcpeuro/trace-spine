@@ -1,0 +1,166 @@
+#+title: L2 — Generative Refutation (Property Tests)
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:nil num:nil
+
+* Overview
+
+L2 properties are generative tests run against every adapter implementation.
+Failure produces a shrunken counterexample bound to a seed; the seed is the bug report.
+
+* Generators
+
+#+begin_src clojure
+;; WellFormedTraceContext generator
+(def gen-trace-id
+  (gen/fmap #(apply str %)
+            (gen/vector (gen/elements "0123456789abcdef") 32)))
+
+(def gen-span-id
+  (gen/fmap #(apply str %)
+            (gen/vector (gen/elements "0123456789abcdef") 16)))
+
+(def gen-flags
+  (gen/elements ["00" "01"]))
+
+(def gen-trace-context
+  (gen/let [trace-id gen-trace-id
+            span-id  gen-span-id
+            flags    gen-flags]
+    {:trace-id trace-id
+     :span-id  span-id
+     :flags    flags}))
+
+;; EmptyCarrier generator
+(def gen-empty-carrier
+  (gen/return {}))
+#+end_src
+
+* Properties
+
+** roundtrip
+
+#+begin_src text
+property roundtrip:
+  forall ctx :: WellFormedTraceContext,
+         carrier :: EmptyCarrier:
+    extract(after(inject(ctx, carrier), carrier)) == Some(ctx)
+#+end_src
+
+Refutes: I-spine-wellformed (if format/parse is broken)
+
+Seed file: ~conformance/seeds/roundtrip.edn~
+
+** continuation
+
+#+begin_src text
+property continuation:
+  forall ctx :: WellFormedTraceContext,
+         req :: IngressRequest with traceparent = ctx:
+    let downstream_calls = simulate_handler(req)
+    in forall call in downstream_calls:
+         extract(call.carrier).trace_id == ctx.trace_id
+#+end_src
+
+Refutes: I-spine-monotonic, C-1
+
+Seed file: ~conformance/seeds/continuation.edn~
+
+** no_fabrication
+
+#+begin_src text
+property no_fabrication:
+  forall req :: InternalRequest without traceparent:
+    when handled by non_ingress_service:
+      result is error AND no trace_id is generated
+#+end_src
+
+Refutes: I-spine-no-fabrication, C-3
+
+Seed file: ~conformance/seeds/no_fabrication.edn~
+
+** monotonic_ids
+
+#+begin_src text
+property monotonic_ids:
+  forall trace :: ExecutedTrace:
+    let ids = collect_span_ids(trace)
+    in parent_chain_connected(ids) AND trace_id_constant(ids)
+#+end_src
+
+Refutes: I-spine-monotonic, C-2
+
+Seed file: ~conformance/seeds/monotonic_ids.edn~
+
+** cross_substrate
+
+#+begin_src text
+property cross_substrate:
+  forall ctx :: WellFormedTraceContext,
+         path :: SubstrateChain (HTTP -> Kafka -> aq -> outbox -> Kafka):
+    let final_ctx = simulate_propagation(ctx, path)
+    in trace_id(final_ctx) == trace_id(ctx)
+#+end_src
+
+Refutes: C-2
+
+Seed file: ~conformance/seeds/cross_substrate.edn~
+
+This property runs against docker-compose substrate stand-up (nightly).
+
+** budget
+
+#+begin_src text
+property budget:
+  forall ctx :: WellFormedTraceContext,
+         crossing :: Crossing:
+    overhead_p99(propagate(ctx, crossing)) < 50us
+#+end_src
+
+Refutes: I-spine-budget, C-4
+
+Seed file: ~conformance/seeds/budget.edn~
+
+** no_leak
+
+#+begin_src text
+property no_leak:
+  forall ctx :: WellFormedTraceContext,
+         error :: ServiceError:
+    let response = format_error_response(error, ctx)
+    in NOT contains(response.body, ctx.trace_id)
+       AND NOT contains(response.headers["X-Request-Id"], ctx.trace_id)
+#+end_src
+
+Refutes: I-spine-no-leak, C-6
+
+Seed file: ~conformance/seeds/no_leak.edn~
+
+* Running the properties
+
+#+begin_src bash
+# Run all properties
+cd conformance/harness
+./run-properties.sh
+
+# Run specific property with seed
+./run-properties.sh --property roundtrip --seed 42
+
+# Replay a failing seed
+./run-properties.sh --replay conformance/seeds/roundtrip-failure-12345.edn
+#+end_src
+
+* Shrinking
+
+When a property fails, the harness shrinks the counterexample to minimal size:
+
+1. Reduce trace-id to smallest failing value
+2. Reduce carrier to minimal failing state
+3. Record shrunken example with seed to ~conformance/seeds/~
+4. The seed file IS the bug report; attach to issue
+
+* Cross-references
+
+- L0 claims: [[file:L0-claims.org]]
+- L1 contracts (what we're testing): [[file:L1-contracts.org]]
+- CPRR table (conjectures we're refuting): [[file:cprr.org]]

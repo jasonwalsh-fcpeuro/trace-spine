@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# bin/push-all — Push branches, notes, and claims to origin and archive
+#
+# Usage: bin/push-all [--dry-run]
+#
+# Environment:
+#   TRACE_SPINE_ARCHIVE — Path to archive remote (default: ~/ghq/mirror/aygp-dr/trace-spine.git)
+#
+
+set -euo pipefail
+
+DRY_RUN=""
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY_RUN="echo [dry-run]"
+fi
+
+ARCHIVE="${TRACE_SPINE_ARCHIVE:-$HOME/ghq/mirror/aygp-dr/trace-spine.git}"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+log_ok() { echo -e "${GREEN}✓${NC} $1"; }
+log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
+log_err() { echo -e "${RED}✗${NC} $1"; }
+
+# Check remotes exist
+check_remote() {
+  local remote="$1"
+  if ! git remote get-url "$remote" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+# Push a refspec to a remote
+push_ref() {
+  local remote="$1"
+  local refspec="$2"
+  local desc="$3"
+
+  if $DRY_RUN git push "$remote" "$refspec" 2>/dev/null; then
+    log_ok "$desc → $remote"
+    return 0
+  else
+    log_err "$desc → $remote (failed)"
+    return 1
+  fi
+}
+
+echo "=== Push Discipline: trace-spine ==="
+echo ""
+
+# Get current branch
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo "Current branch: $BRANCH"
+echo ""
+
+# Track failures
+FAILURES=0
+
+# --- Push to origin ---
+echo "--- origin ---"
+
+if ! check_remote origin; then
+  log_err "Remote 'origin' not configured"
+  exit 1
+fi
+
+# 1. Branch
+push_ref origin "$BRANCH" "branch $BRANCH" || ((FAILURES++))
+
+# 2. Notes refs
+for note_type in conjecture refutation experiment deviation test; do
+  ref="refs/notes/${note_type}"
+  if git show-ref --verify --quiet "$ref" 2>/dev/null; then
+    push_ref origin "${ref}:${ref}" "notes/$note_type" || ((FAILURES++))
+  else
+    log_warn "notes/$note_type (not found, skipping)"
+  fi
+done
+
+# 3. Agent claims
+if git show-ref --quiet 'refs/agents/' 2>/dev/null; then
+  push_ref origin 'refs/agents/*:refs/agents/*' "agent claims" || ((FAILURES++))
+else
+  log_warn "agent claims (none found, skipping)"
+fi
+
+echo ""
+
+# --- Push to archive ---
+echo "--- archive ---"
+
+if ! check_remote archive; then
+  log_warn "Remote 'archive' not configured"
+  log_warn "To add: git remote add archive $ARCHIVE"
+  echo ""
+else
+  # 1. Branch
+  push_ref archive "$BRANCH" "branch $BRANCH" || ((FAILURES++))
+
+  # 2. Notes refs
+  for note_type in conjecture refutation experiment deviation test; do
+    ref="refs/notes/${note_type}"
+    if git show-ref --verify --quiet "$ref" 2>/dev/null; then
+      push_ref archive "${ref}:${ref}" "notes/$note_type" || ((FAILURES++))
+    fi
+  done
+
+  # 3. Agent claims
+  if git show-ref --quiet 'refs/agents/' 2>/dev/null; then
+    push_ref archive 'refs/agents/*:refs/agents/*' "agent claims" || ((FAILURES++))
+  fi
+
+  echo ""
+fi
+
+# --- Summary ---
+if [[ $FAILURES -eq 0 ]]; then
+  log_ok "All refs pushed successfully"
+  exit 0
+else
+  log_err "$FAILURES push(es) failed"
+  exit 1
+fi

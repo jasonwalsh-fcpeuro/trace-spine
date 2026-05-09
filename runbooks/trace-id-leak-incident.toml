@@ -1,0 +1,102 @@
+# Runbook: Trace ID Leak Incident
+# Triggered when trace id appears in user-visible surface
+
+[metadata]
+id = "rb-003"
+title = "Trace ID Leak Incident"
+severity = "high"
+conjectures = ["C-6"]
+last_updated = "2026-05-09"
+
+[symptoms]
+description = """
+Trace id has been exposed to users or external systems in a way that
+violates the redaction policy. This is a privacy/security concern.
+"""
+
+indicators = [
+    "User report: trace id visible in error message",
+    "Security scan: trace id pattern found in response body",
+    "Log audit: trace id in public-facing log stream",
+    "HTML source: trace id embedded in page"
+]
+
+[diagnosis]
+steps = [
+    "Identify the leak surface (response body / log / HTML / header)",
+    "Trace the code path that produced the leak",
+    "Check if redaction middleware is installed",
+    "Check if error formatter is wrapping exceptions correctly",
+    "Determine blast radius: how many users / how long"
+]
+
+detection_queries = """
+# Search logs for trace id pattern in user-visible fields
+grep -E '00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}' access.log
+
+# Check response body samples
+curl -s https://service/endpoint | grep -E '00-[0-9a-f]{32}'
+"""
+
+[remediation]
+immediate = [
+    "Patch error formatter to exclude trace id from response",
+    "Add redaction filter to log pipeline",
+    "Deploy fix to affected services"
+]
+
+verification = [
+    "Replay failing request, verify trace id not in response",
+    "Run no_leak property test locally",
+    "Check CI passes with updated redaction"
+]
+
+[redaction_policy]
+allowed = [
+    "Server-side logs (operator access only)",
+    "OTel collector / backend (operator access only)",
+    "X-Request-Id header: hash(trace_id), NOT raw trace_id"
+]
+
+forbidden = [
+    "Response body (JSON error messages)",
+    "HTML content (error pages)",
+    "Public log streams (access logs without filtering)",
+    "Client-side JavaScript (no trace id in window scope)"
+]
+
+hash_format = """
+X-Request-Id: SHA256(trace_id)[:16]
+
+Example:
+  trace_id: 4bf92f3577b34da6a3ce929d0e0e4736
+  X-Request-Id: 8a3b2c1d4e5f6a7b
+"""
+
+[escalation]
+primary = "spine-engineer"
+secondary = "security team (if PII concern)"
+cross_team = "Affected service team"
+
+[postmortem]
+required_fields = [
+    "Leak surface (response / log / HTML)",
+    "Blast radius (users affected, duration)",
+    "Root cause (missing redaction / formatter bug)",
+    "C-5 update needed? (did harness catch it?)"
+]
+
+severity_classification = """
+- Low: Internal log, no external exposure
+- Medium: Error response to authenticated user
+- High: Error response to anonymous user / public page
+- Critical: Trace id correlates to PII or security-sensitive data
+"""
+
+[prevention]
+code_review_checklist = [
+    "Error formatters do not include trace context",
+    "Log statements use structured logging with redaction",
+    "HTML templates do not interpolate trace context",
+    "Response headers use hashed request id, not raw trace id"
+]

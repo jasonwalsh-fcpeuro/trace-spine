@@ -1,0 +1,89 @@
+# Runbook: Propagation Budget Exceeded
+# Triggered when p99 latency > 50µs
+
+[metadata]
+id = "rb-002"
+title = "Propagation Budget Exceeded"
+severity = "medium"
+conjectures = ["C-4"]
+last_updated = "2026-05-09"
+
+[symptoms]
+description = """
+Trace-spine middleware is adding more than 50µs p99 latency to requests.
+Detected by:
+- Conformance harness budget property failure
+- Production latency regression alerts
+- Adapter benchmark showing p99 >= 50µs
+"""
+
+indicators = [
+    "CI: budget property test failure",
+    "Metrics: service_latency_p99 increase correlating with trace-spine deploy",
+    "Bench output: overhead_p99 >= 50µs"
+]
+
+[diagnosis]
+steps = [
+    "Run benchmark in isolation: cd conformance && ./bench.sh <adapter>",
+    "Profile the hot path: extract, inject, span creation",
+    "Check for regex compilation on every call (should be static)",
+    "Check for excessive allocations in middleware",
+    "Compare against baseline adapter benchmark"
+]
+
+profiling = """
+# Clojure adapter profiling
+clj -M:bench -m trace-spine.bench/profile
+
+# Ruby adapter profiling
+bundle exec ruby bench/profile.rb
+
+# Go adapter profiling
+go test -bench=. -cpuprofile=cpu.prof ./...
+go tool pprof cpu.prof
+"""
+
+[remediation]
+steps = [
+    "If regex hot: compile once at load time, not per-call",
+    "If allocation hot: pool or reuse span objects",
+    "If string format hot: use byte buffer instead of string concat",
+    "If structural: file ADR for budget waiver with justification"
+]
+
+optimization_targets = [
+    "extract(): target < 10µs p99",
+    "inject(): target < 10µs p99",
+    "span creation: target < 15µs p99"
+]
+
+[escalation]
+primary = "spine-engineer"
+secondary = "spec-keeper (if ADR waiver needed)"
+
+[budget_waiver]
+process = """
+1. Document why service cannot meet budget
+2. Propose new budget with measurement evidence
+3. File ADR with refutation condition
+4. Add exemption to .trace-spine.yaml with ADR id
+5. Spec-keeper must approve ADR before merge
+"""
+
+example_exemption = """
+# .trace-spine.yaml
+exemptions:
+  - adr: ADR-0010
+    reason: "Cold-start serverless, 100µs budget"
+    expires: 2026-12-31
+"""
+
+[postmortem]
+required_fields = [
+    "Measured p99 before fix",
+    "Root cause (hot path identification)",
+    "Fix applied",
+    "Measured p99 after fix",
+    "ADR waiver filed? (yes/no)"
+]

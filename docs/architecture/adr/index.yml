@@ -1,0 +1,71 @@
+adrs:
+  - id: "0001"
+    title: Record Architecture Decisions
+    status: accepted
+    date: 2026-05-09
+
+  - id: "0002"
+    title: W3C Trace Context Version 00
+    status: accepted
+    date: 2026-05-09
+    references:
+      - spec/L1-wire.org
+      - C-2
+
+  - id: "0003"
+    title: No Internal Trace Origination
+    status: accepted
+    date: 2026-05-09
+    references:
+      - spec/L0-claims.org#I-spine-no-fabrication
+      - C-3
+
+  - id: "0004"
+    title: 50µs Propagation Budget
+    status: accepted
+    date: 2026-05-09
+    references:
+      - spec/L0-claims.org#I-spine-budget
+      - C-4
+
+  - id: "0005"
+    title: Cross-Substrate Chain Property Test
+    status: accepted
+    date: 2026-05-09
+    references:
+      - spec/L2-properties.org
+      - C-2
+
+  - id: "0006"
+    title: aq Deferred for Multi-Agent Coordination
+    status: accepted
+    date: 2026-05-09
+    references:
+      - docs/working/multi-agent.org
+    refutation: "Two agents collide on same commit twice in a sprint"
+
+  - id: "0007"
+    title: Stacked-Diff Discipline as Merge Policy
+    status: accepted
+    date: 2026-05-09
+    references:
+      - docs/working/stacking.org
+    refutation: "Developer reports stacking overhead exceeds review benefit 3x"
+
+  - id: "0008"
+    title: CPRR-in-Git-Notes as Durable Reasoning Record
+    status: accepted
+    date: 2026-05-09
+    references:
+      - docs/working/cprr-notes.org
+      - schema/notes/
+    refutation: "Any notes ref empty after one week of active work"
+
+  - id: "0009"
+    title: Dual-Remote Push Policy
+    status: accepted
+    date: 2026-05-09
+    references:
+      - docs/working/push-policy.org
+      - bin/push-all
+    refutation: "rebuild-check fails on archive clone"

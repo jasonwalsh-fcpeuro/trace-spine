@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aygp-dr/trace-spine/schema/notes/test.schema.json",
+  "title": "CPRR Test Note",
+  "description": "Git note recording property test seed and counterexamples",
+  "type": "object",
+  "required": ["schema", "trace_id", "commit", "timestamp", "test"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "cprr-test/v1"
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9A-Z]{26}$",
+      "description": "ULID from work session"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "Git commit SHA"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp"
+    },
+    "test": {
+      "type": "object",
+      "required": ["property", "seed", "status"],
+      "properties": {
+        "property": {
+          "type": "string",
+          "description": "Property test name (e.g., roundtrip, continuation)"
+        },
+        "seed": {
+          "type": "integer",
+          "description": "Random seed used for this run"
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of samples generated"
+        },
+        "shrunk_counterexample": {
+          "type": ["string", "null"],
+          "description": "Shrunk counterexample if test failed"
+        },
+        "last_good_seed": {
+          "type": ["integer", "null"],
+          "description": "Most recent seed that passed"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pass", "fail", "error"],
+          "description": "Test outcome"
+        },
+        "failure_message": {
+          "type": "string",
+          "description": "Error message if status is fail or error"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

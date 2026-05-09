@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aygp-dr/trace-spine/schema/notes/refutation.schema.json",
+  "title": "CPRR Refutation Note",
+  "description": "Git note recording evidence that falsifies a conjecture",
+  "type": "object",
+  "required": ["schema", "trace_id", "commit", "timestamp", "refutation"],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "cprr-refutation/v1"
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9A-Z]{26}$",
+      "description": "ULID from work session"
+    },
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$",
+      "description": "Git commit SHA"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 UTC timestamp"
+    },
+    "refutation": {
+      "type": "object",
+      "required": ["conjecture_id", "evidence"],
+      "properties": {
+        "conjecture_id": {
+          "type": "string",
+          "pattern": "^C-(local-)?[0-9]+$",
+          "description": "ID of the conjecture being refuted"
+        },
+        "cprr_ref": {
+          "type": "string",
+          "pattern": "^C-[0-9]+$",
+          "description": "Reference to spec/cprr.org row if applicable"
+        },
+        "evidence": {
+          "type": "string",
+          "description": "Description of the falsifying evidence"
+        },
+        "counterexample": {
+          "type": "string",
+          "description": "Specific counterexample if applicable"
+        },
+        "refinement": {
+          "type": "string",
+          "description": "Proposed refinement based on refutation"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

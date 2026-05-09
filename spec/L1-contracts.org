@@ -1,0 +1,118 @@
+#+title: L1 — Function Contracts
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:nil num:nil
+
+* Overview
+
+L1 function contracts define what the trace-spine library guarantees.
+These are Dafny-shaped specifications; implementations must satisfy them.
+
+* Core types
+
+#+begin_src text
+type TraceId      = String  // 32 hex chars, not all zeros
+type SpanId       = String  // 16 hex chars, not all zeros
+type Flags        = Byte    // sampling and reserved bits
+type TraceContext = { trace_id: TraceId, span_id: SpanId, flags: Flags }
+type Carrier      = Map<String, String>  // abstract carrier (HTTP headers, Kafka headers, etc.)
+#+end_src
+
+* extract
+
+#+begin_src text
+extract(carrier: Carrier) -> Option<TraceContext>
+
+ensures:
+  - returns None iff carrier has no valid traceparent
+  - returns Some(ctx) ==> ctx.trace_id matches W3C format
+  - returns Some(ctx) ==> ctx.span_id matches W3C format
+  - never throws on malformed input; logs warning and returns None
+  - pure function: no side effects on carrier
+#+end_src
+
+* inject
+
+#+begin_src text
+inject(ctx: TraceContext, carrier: Carrier) -> ()
+
+requires:
+  - ctx.trace_id is WellFormed
+  - ctx.span_id is WellFormed
+
+ensures:
+  - extract(carrier) after inject yields Some(ctx')
+    where ctx'.trace_id == ctx.trace_id
+  - idempotent: inject(ctx, inject(ctx, carrier)) == inject(ctx, carrier)
+  - carrier["traceparent"] is set to formatted value
+#+end_src
+
+* continue_or_start
+
+#+begin_src text
+continue_or_start(carrier: Carrier, is_ingress: Boolean) -> TraceContext
+
+ensures:
+  - if extract(carrier) == Some(ctx):
+      returns new_ctx where
+        new_ctx.trace_id == ctx.trace_id
+        new_ctx.span_id is fresh (new child span)
+        new_ctx.flags preserves ctx.flags
+
+  - if extract(carrier) == None AND is_ingress:
+      returns new_ctx where
+        new_ctx.trace_id is fresh (new trace)
+        new_ctx.span_id is fresh
+        new_ctx.flags == 01 (sampled by default, configurable)
+
+  - if extract(carrier) == None AND NOT is_ingress:
+      raises ProgrammerError("internal service must not originate trace")
+#+end_src
+
+* middleware
+
+#+begin_src text
+middleware(framework: Framework) -> Middleware
+
+ensures:
+  - every request passing through middleware has TraceContext in scope
+  - context is accessible via framework-idiomatic API
+  - every outbound call from request scope has inject called before send
+  - span lifetime brackets request lifetime
+  - span.start_time <= request handling <= span.end_time
+  - span is emitted to configured exporter on request completion
+#+end_src
+
+* create_child
+
+#+begin_src text
+create_child(parent: TraceContext) -> TraceContext
+
+ensures:
+  - child.trace_id == parent.trace_id
+  - child.span_id is fresh
+  - child.flags == parent.flags (sampling decision preserved)
+#+end_src
+
+* format / parse
+
+#+begin_src text
+format(ctx: TraceContext) -> String
+
+ensures:
+  - result matches regex ^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$
+  - parse(format(ctx)) == Some(ctx)
+
+parse(s: String) -> Option<TraceContext>
+
+ensures:
+  - returns None iff s does not match regex
+  - returns Some(ctx) iff s is well-formed
+  - parse(format(ctx)) == Some(ctx) for all valid ctx
+#+end_src
+
+* Cross-references
+
+- L0 claims: [[file:L0-claims.org]]
+- L1 wire format: [[file:L1-wire.org]]
+- L2 properties (test these contracts): [[file:L2-properties.org]]
