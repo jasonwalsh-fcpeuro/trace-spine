@@ -88,16 +88,20 @@ for file in "${FILES[@]}"; do
   fi
 
   # Check 2: Balanced source blocks
-  begin_count=$(grep -ci '^[[:space:]]*#+begin_' "$file" 2>/dev/null || echo 0)
-  end_count=$(grep -ci '^[[:space:]]*#+end_' "$file" 2>/dev/null || echo 0)
+  begin_count=$(grep -ci '^[[:space:]]*#+begin_' "$file" 2>/dev/null || true)
+  begin_count=${begin_count:-0}
+  end_count=$(grep -ci '^[[:space:]]*#+end_' "$file" 2>/dev/null || true)
+  end_count=${end_count:-0}
   if [[ "$begin_count" != "$end_count" ]]; then
     log_fail "$file: Unbalanced blocks (begin: $begin_count, end: $end_count)"
     file_errors=$((file_errors + 1))
   fi
 
   # Check 3: Balanced property drawers
-  props_start=$(grep -c '^[[:space:]]*:PROPERTIES:' "$file" 2>/dev/null || echo 0)
-  props_end=$(grep -c '^[[:space:]]*:END:' "$file" 2>/dev/null || echo 0)
+  props_start=$(grep -c '^[[:space:]]*:PROPERTIES:' "$file" 2>/dev/null || true)
+  props_start=${props_start:-0}
+  props_end=$(grep -c '^[[:space:]]*:END:' "$file" 2>/dev/null || true)
+  props_end=${props_end:-0}
   # Note: :END: is used for both PROPERTIES and other drawers, so we just check they exist
   if [[ "$props_start" -gt 0 ]] && [[ "$props_end" -lt "$props_start" ]]; then
     log_fail "$file: Unclosed property drawers"
@@ -107,26 +111,27 @@ for file in "${FILES[@]}"; do
   # Check 4: Trailing whitespace (warning only)
   if grep -qE '[[:space:]]$' "$file" 2>/dev/null; then
     log_warn "$file: Has trailing whitespace"
-    ((file_warnings++))
+    file_warnings=$((file_warnings + 1))
   fi
 
   # Check 5: Mixed tabs and spaces in indentation (warning only)
-  if grep -qP '^\t+ ' "$file" 2>/dev/null || grep -qP '^ +\t' "$file" 2>/dev/null; then
+  # Note: Using grep -E instead of -P for portability (FreeBSD doesn't support PCRE)
+  if grep -qE $'^\\t+ ' "$file" 2>/dev/null || grep -qE $'^ +\\t' "$file" 2>/dev/null; then
     log_warn "$file: Mixed tabs and spaces in indentation"
-    ((file_warnings++))
+    file_warnings=$((file_warnings + 1))
   fi
 
   # Check 6: Empty file
   if [[ ! -s "$file" ]]; then
     log_warn "$file: Empty file"
-    ((file_warnings++))
+    file_warnings=$((file_warnings + 1))
   fi
 
   # Check 7: Suspicious patterns
-  # Unclosed links
-  if grep -qP '\[\[[^\]]*$' "$file" 2>/dev/null; then
+  # Unclosed links (link that starts on a line but doesn't close)
+  if grep -qE '\[\[[^]]*$' "$file" 2>/dev/null; then
     log_warn "$file: Possible unclosed link"
-    ((file_warnings++))
+    file_warnings=$((file_warnings + 1))
   fi
 
   # Report success if no errors
