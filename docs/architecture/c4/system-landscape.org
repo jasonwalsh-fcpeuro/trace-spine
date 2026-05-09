@@ -1,0 +1,401 @@
+#+title: C4 Architecture — Petstore Commerce Platform
+#+author: trace-spine team
+#+date: 2026-05-09
+#+property: header-args :mkdirp t
+#+options: toc:3 num:t
+
+* Overview
+
+This document contains all four levels of the C4 model for the Petstore Commerce
+Platform — a Clojure/ClojureScript ecommerce system with trace-spine integration.
+
+All diagrams use Mermaid with C4 extensions. The diagrams are the source of truth;
+code must conform to these contracts.
+
+** Maintenance Protocol
+
+C4 diagrams MUST be updated when:
+1. New service is added
+2. Service boundary changes
+3. Data flow changes between containers
+4. New external system integration
+
+Agents working on platform/* MUST run ~bin/c4-check~ before committing.
+
+* Level 1: System Context
+
+Who uses the system and what external systems does it integrate with?
+
+#+begin_src mermaid :file c4-context.png :eval never-export
+C4Context
+    title System Context - Petstore Commerce Platform
+
+    Person(customer, "Customer", "Browses products, places orders, manages account")
+    Person(merchant, "Merchant", "Manages inventory, views analytics, configures features")
+    Person(ops, "Operations", "Monitors system health, manages fraud rules")
+
+    System(platform, "Petstore Commerce Platform", "Clojure/ClojureScript ecommerce platform with trace propagation")
+
+    System_Ext(stripe, "Stripe", "Payment processing")
+    System_Ext(paypal, "PayPal", "Alternative payment method")
+    System_Ext(shipstation, "ShipStation", "Shipping label generation and tracking")
+    System_Ext(plaid, "Plaid", "Bank account verification for wallet")
+    System_Ext(datadog, "Datadog", "External metrics aggregation")
+    System_Ext(launchdarkly, "LaunchDarkly", "External feature flag provider (optional)")
+
+    Rel(customer, platform, "Browses, orders, pays")
+    Rel(merchant, platform, "Manages products, views reports")
+    Rel(ops, platform, "Monitors, configures rules")
+
+    Rel(platform, stripe, "Processes payments", "HTTPS")
+    Rel(platform, paypal, "Alternative payments", "HTTPS")
+    Rel(platform, shipstation, "Ships orders", "HTTPS")
+    Rel(platform, plaid, "Verifies bank accounts", "HTTPS")
+    Rel(platform, datadog, "Exports metrics", "HTTPS")
+    Rel(platform, launchdarkly, "Syncs flags", "HTTPS")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+* Level 2: Container Diagram
+
+What are the major containers (applications, data stores, services)?
+
+#+begin_src mermaid :file c4-container.png :eval never-export
+C4Container
+    title Container Diagram - Petstore Commerce Platform
+
+    Person(customer, "Customer")
+    Person(merchant, "Merchant")
+
+    System_Boundary(platform, "Petstore Commerce Platform") {
+        Container(spa, "Storefront SPA", "ClojureScript, Re-frame", "Customer-facing shopping experience")
+        Container(admin, "Admin Dashboard", "ClojureScript, Re-frame", "Merchant analytics and management")
+
+        Container(api, "API Gateway", "Clojure, Ring", "REST/GraphQL entry point with trace-spine middleware")
+        Container(catalog, "Catalog Service", "Clojure", "Product catalog, search, categories")
+        Container(cart, "Cart Service", "Clojure", "Shopping cart, sessions")
+        Container(order, "Order Service", "Clojure", "Order lifecycle, checkout")
+
+        Container(wms, "WMS Service", "Clojure", "Warehouse management, inventory, fulfillment")
+        Container(payments, "Payment Service", "Clojure", "Payment orchestration, retry, idempotency")
+        Container(wallet, "Wallet Service", "Clojure", "Store credit, gift cards, loyalty points")
+        Container(fraud, "Fraud Service", "Clojure", "Risk scoring, rule engine, ML signals")
+
+        Container(metrics, "Metrics Platform", "Clojure", "Impressions, clicks, A/B experiments")
+        Container(flags, "Feature Flags", "Clojure", "Flag evaluation, targeting, rollouts")
+
+        ContainerDb(postgres, "PostgreSQL", "Primary data store")
+        ContainerDb(redis, "Redis", "Session cache, rate limiting")
+        ContainerQueue(kafka, "Kafka", "Event streaming, outbox drain")
+    }
+
+    System_Ext(stripe, "Stripe")
+    System_Ext(shipstation, "ShipStation")
+
+    Rel(customer, spa, "Uses", "HTTPS")
+    Rel(merchant, admin, "Uses", "HTTPS")
+
+    Rel(spa, api, "API calls", "HTTPS + traceparent")
+    Rel(admin, api, "API calls", "HTTPS + traceparent")
+
+    Rel(api, catalog, "Queries", "HTTP + traceparent")
+    Rel(api, cart, "Manages", "HTTP + traceparent")
+    Rel(api, order, "Creates", "HTTP + traceparent")
+    Rel(api, flags, "Evaluates", "HTTP + traceparent")
+
+    Rel(order, payments, "Charges", "HTTP + traceparent")
+    Rel(order, wms, "Fulfills", "Kafka + traceparent")
+    Rel(order, fraud, "Scores", "HTTP + traceparent")
+
+    Rel(payments, stripe, "Processes", "HTTPS")
+    Rel(payments, wallet, "Applies credit", "HTTP + traceparent")
+
+    Rel(wms, shipstation, "Ships", "HTTPS")
+
+    Rel(spa, metrics, "Tracks", "HTTP + traceparent")
+    Rel(admin, metrics, "Queries", "HTTP + traceparent")
+
+    Rel(catalog, postgres, "Reads/Writes")
+    Rel(cart, redis, "Caches")
+    Rel(order, postgres, "Reads/Writes")
+    Rel(order, kafka, "Publishes events")
+
+    UpdateLayoutConfig($c4ShapeInRow="4", $c4BoundaryInRow="1")
+#+end_src
+
+* Level 3: Component Diagrams
+
+** API Gateway Components
+
+#+begin_src mermaid :file c4-component-api.png :eval never-export
+C4Component
+    title Component Diagram - API Gateway
+
+    Container_Boundary(api, "API Gateway") {
+        Component(router, "Router", "Reitit", "Route matching and dispatch")
+        Component(auth, "Auth Middleware", "Ring", "JWT validation, session management")
+        Component(trace, "Trace Middleware", "trace-spine", "traceparent extraction/injection")
+        Component(rate, "Rate Limiter", "Ring", "Per-user/IP rate limiting")
+        Component(graphql, "GraphQL Handler", "Lacinia", "GraphQL query execution")
+        Component(rest, "REST Handlers", "Ring", "REST endpoint handlers")
+        Component(cors, "CORS Middleware", "Ring", "Cross-origin configuration")
+    }
+
+    Container(catalog, "Catalog Service")
+    Container(cart, "Cart Service")
+    Container(order, "Order Service")
+    Container(flags, "Feature Flags")
+    ContainerDb(redis, "Redis")
+
+    Rel(router, auth, "Passes request")
+    Rel(auth, trace, "Authenticated request")
+    Rel(trace, rate, "Traced request")
+    Rel(rate, graphql, "GraphQL requests")
+    Rel(rate, rest, "REST requests")
+
+    Rel(graphql, catalog, "Resolves products")
+    Rel(graphql, cart, "Resolves cart")
+    Rel(rest, order, "Creates orders")
+    Rel(auth, flags, "Checks feature access")
+    Rel(rate, redis, "Checks limits")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+** Payment Service Components
+
+#+begin_src mermaid :file c4-component-payments.png :eval never-export
+C4Component
+    title Component Diagram - Payment Service
+
+    Container_Boundary(payments, "Payment Service") {
+        Component(orchestrator, "Payment Orchestrator", "Clojure", "Coordinates payment flow")
+        Component(idempotency, "Idempotency Layer", "Clojure", "Prevents duplicate charges")
+        Component(retry, "Retry Engine", "Clojure", "Exponential backoff, circuit breaker")
+        Component(stripe_adapter, "Stripe Adapter", "Clojure", "Stripe API integration")
+        Component(paypal_adapter, "PayPal Adapter", "Clojure", "PayPal API integration")
+        Component(outbox, "Outbox Publisher", "Clojure", "Transactional outbox pattern")
+    }
+
+    Container(wallet, "Wallet Service")
+    Container(fraud, "Fraud Service")
+    ContainerDb(postgres, "PostgreSQL")
+    ContainerQueue(kafka, "Kafka")
+    System_Ext(stripe, "Stripe")
+    System_Ext(paypal, "PayPal")
+
+    Rel(orchestrator, idempotency, "Checks/records")
+    Rel(orchestrator, fraud, "Pre-auth check")
+    Rel(orchestrator, wallet, "Applies credits")
+    Rel(idempotency, retry, "Proceeds if new")
+    Rel(retry, stripe_adapter, "Primary processor")
+    Rel(retry, paypal_adapter, "Fallback processor")
+    Rel(orchestrator, outbox, "Records outcome")
+
+    Rel(stripe_adapter, stripe, "HTTPS")
+    Rel(paypal_adapter, paypal, "HTTPS")
+    Rel(idempotency, postgres, "Reads/Writes")
+    Rel(outbox, kafka, "Publishes")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+** WMS Service Components
+
+#+begin_src mermaid :file c4-component-wms.png :eval never-export
+C4Component
+    title Component Diagram - WMS Service
+
+    Container_Boundary(wms, "WMS Service") {
+        Component(inventory, "Inventory Manager", "Clojure", "Stock levels, reservations")
+        Component(allocation, "Order Allocator", "Clojure", "Assigns inventory to orders")
+        Component(fulfillment, "Fulfillment Engine", "Clojure", "Pick, pack, ship workflow")
+        Component(shipping, "Shipping Integration", "Clojure", "Carrier rate shopping, labels")
+        Component(returns, "Returns Processor", "Clojure", "RMA handling, restocking")
+    }
+
+    ContainerDb(postgres, "PostgreSQL")
+    ContainerQueue(kafka, "Kafka")
+    System_Ext(shipstation, "ShipStation")
+
+    Rel(allocation, inventory, "Reserves stock")
+    Rel(fulfillment, allocation, "Gets allocations")
+    Rel(fulfillment, shipping, "Creates shipments")
+    Rel(shipping, shipstation, "HTTPS")
+    Rel(returns, inventory, "Restocks")
+
+    Rel(inventory, postgres, "Reads/Writes")
+    Rel(allocation, kafka, "Consumes orders")
+    Rel(fulfillment, kafka, "Publishes shipped")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+** Fraud Service Components
+
+#+begin_src mermaid :file c4-component-fraud.png :eval never-export
+C4Component
+    title Component Diagram - Fraud Service
+
+    Container_Boundary(fraud, "Fraud Service") {
+        Component(scorer, "Risk Scorer", "Clojure", "Aggregates signals into score")
+        Component(rules, "Rule Engine", "Clojure", "Configurable fraud rules")
+        Component(velocity, "Velocity Checker", "Clojure", "Rate-based fraud detection")
+        Component(ml, "ML Signals", "Clojure", "Feature extraction for ML model")
+        Component(blocklist, "Blocklist Manager", "Clojure", "IP, email, device blocklists")
+    }
+
+    ContainerDb(postgres, "PostgreSQL")
+    ContainerDb(redis, "Redis")
+
+    Rel(scorer, rules, "Applies rules")
+    Rel(scorer, velocity, "Checks velocity")
+    Rel(scorer, ml, "Gets ML score")
+    Rel(scorer, blocklist, "Checks blocklists")
+
+    Rel(rules, postgres, "Reads rules")
+    Rel(velocity, redis, "Counts events")
+    Rel(blocklist, redis, "Cached lists")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+** Metrics Platform Components
+
+#+begin_src mermaid :file c4-component-metrics.png :eval never-export
+C4Component
+    title Component Diagram - Metrics Platform
+
+    Container_Boundary(metrics, "Metrics Platform") {
+        Component(collector, "Event Collector", "Clojure", "Ingests impression/click events")
+        Component(aggregator, "Aggregator", "Clojure", "Real-time rollups")
+        Component(experiments, "A/B Engine", "Clojure", "Experiment assignment, analysis")
+        Component(query, "Query API", "Clojure", "Analytics queries")
+        Component(exporter, "Exporter", "Clojure", "Pushes to external systems")
+    }
+
+    Container(flags, "Feature Flags")
+    ContainerDb(clickhouse, "ClickHouse", "Analytics OLAP")
+    ContainerQueue(kafka, "Kafka")
+    System_Ext(datadog, "Datadog")
+
+    Rel(collector, kafka, "Publishes events")
+    Rel(aggregator, kafka, "Consumes events")
+    Rel(aggregator, clickhouse, "Writes rollups")
+    Rel(experiments, flags, "Gets assignments")
+    Rel(experiments, clickhouse, "Reads results")
+    Rel(query, clickhouse, "Queries")
+    Rel(exporter, datadog, "Pushes metrics")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+** Feature Flags Components
+
+#+begin_src mermaid :file c4-component-flags.png :eval never-export
+C4Component
+    title Component Diagram - Feature Flags Service
+
+    Container_Boundary(flags, "Feature Flags Service") {
+        Component(evaluator, "Flag Evaluator", "Clojure", "Evaluates flags for context")
+        Component(targeting, "Targeting Engine", "Clojure", "User/segment targeting rules")
+        Component(rollout, "Rollout Manager", "Clojure", "Percentage rollouts, schedules")
+        Component(sync, "External Sync", "Clojure", "Syncs with LaunchDarkly if configured")
+        Component(admin_api, "Admin API", "Clojure", "Flag CRUD operations")
+    }
+
+    ContainerDb(postgres, "PostgreSQL")
+    ContainerDb(redis, "Redis")
+    System_Ext(launchdarkly, "LaunchDarkly")
+
+    Rel(evaluator, targeting, "Gets rules")
+    Rel(evaluator, rollout, "Gets rollout state")
+    Rel(evaluator, redis, "Cached flags")
+    Rel(targeting, postgres, "Reads rules")
+    Rel(rollout, postgres, "Reads/Writes")
+    Rel(sync, launchdarkly, "Bidirectional sync")
+    Rel(admin_api, postgres, "CRUD")
+
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
+#+end_src
+
+* Level 4: Code Diagrams
+
+Code-level diagrams are generated from source and live in platform/<service>/docs/.
+They are NOT duplicated here. Each service maintains its own code diagrams.
+
+** Code Diagram Locations
+
+| Service       | Code Diagram Location                    |
+|---------------|------------------------------------------|
+| api           | platform/api/docs/code-diagram.org       |
+| catalog       | platform/api/docs/catalog-code.org       |
+| cart          | platform/api/docs/cart-code.org          |
+| order         | platform/api/docs/order-code.org         |
+| wms           | platform/wms/docs/code-diagram.org       |
+| payments      | platform/payments/docs/code-diagram.org  |
+| wallet        | platform/wallet/docs/code-diagram.org    |
+| fraud         | platform/fraud/docs/code-diagram.org     |
+| metrics       | platform/metrics/docs/code-diagram.org   |
+| feature-flags | platform/feature-flags/docs/code-diagram.org |
+
+** Code Diagram Generation
+
+Each service has a ~docs/generate-code-diagram.clj~ script that:
+1. Parses the namespace structure
+2. Extracts public function signatures
+3. Generates Mermaid class diagrams
+4. Outputs to ~docs/code-diagram.org~
+
+Run via: ~clj -M:dev -m docs.generate-code-diagram~
+
+* Trace Propagation Map
+
+How traceparent flows through the system:
+
+#+begin_src mermaid :file trace-flow.png :eval never-export
+sequenceDiagram
+    participant Browser as SPA (ClojureScript)
+    participant API as API Gateway
+    participant Order as Order Service
+    participant Fraud as Fraud Service
+    participant Payment as Payment Service
+    participant Kafka as Kafka
+    participant WMS as WMS Service
+
+    Browser->>+API: POST /checkout (traceparent: 00-abc...)
+    API->>API: trace-spine middleware extracts context
+    API->>+Fraud: POST /score (traceparent: 00-abc...-child1)
+    Fraud-->>-API: {score: 0.2}
+    API->>+Order: POST /orders (traceparent: 00-abc...-child2)
+    Order->>+Payment: POST /charge (traceparent: 00-abc...-child3)
+    Payment-->>-Order: {status: success}
+    Order->>Kafka: order.created (traceparent in header)
+    Order-->>-API: {order_id: 123}
+    API-->>-Browser: {order_id: 123}
+
+    Kafka->>+WMS: consume order.created (traceparent: 00-abc...)
+    WMS->>WMS: Allocate inventory
+    WMS->>Kafka: order.shipped (traceparent preserved)
+    WMS-->>-Kafka: ack
+#+end_src
+
+* Data Flow Summary
+
+| Source | Target | Protocol | Trace Carrier |
+|--------|--------|----------|---------------|
+| SPA | API Gateway | HTTPS | traceparent header |
+| Admin | API Gateway | HTTPS | traceparent header |
+| API Gateway | Any Service | HTTP | traceparent header |
+| Service | Service | HTTP | traceparent header |
+| Service | Kafka | Kafka | traceparent in message headers |
+| Service | PostgreSQL | JDBC | span context in outbox table |
+| Kafka Consumer | Service | Kafka | traceparent from message headers |
+
+* Cross-References
+
+- spec/L1-wire.org: traceparent format specification
+- conformance/: Harness for validating trace propagation
+- ADR-0002: W3C Trace Context adoption
+- ADR-0005: Cross-substrate chain test

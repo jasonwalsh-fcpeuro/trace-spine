@@ -1,0 +1,144 @@
+#+title: Documentation Architecture and Mandate
+#+author: trace-spine team
+#+date: 2026-05-09
+#+options: toc:2 num:t
+
+* Overview
+
+This document defines where documentation lives, who owns it, and when it must
+be updated. It is the mandate for all documentation in the trace-spine repository.
+
+* Documentation Types and Locations
+
+| Type                | Location                          | Format    | Owner           | Update trigger              |
+|---------------------|-----------------------------------|-----------|-----------------|----------------------------|
+| Spec (L0-L3)        | spec/*.org                        | Org-mode  | spec-keeper     | Contract change            |
+| C4 Architecture     | docs/architecture/c4/             | Org+Mermaid | spine-engineer | Service boundary change    |
+| ADRs                | docs/architecture/adr/            | Markdown  | spec-keeper     | Architectural decision     |
+| Working Discipline  | docs/working/                     | Org-mode  | spec-keeper     | Process change             |
+| Runbooks            | runbooks/                         | TOML      | spine-engineer  | Incident class discovered  |
+| API Reference       | platform/<svc>/docs/api.org       | Org-mode  | spine-engineer  | Endpoint change            |
+| Code Diagrams       | platform/<svc>/docs/code-*.org    | Org+Mermaid | spine-engineer | Major refactor           |
+| Planning            | docs/planning/                    | Org-mode  | spec-keeper     | Phase transition           |
+| Skills              | skills/<name>/SKILL.md            | Markdown  | any             | Skill definition change    |
+
+* Mandates
+
+** Spec (spec/*.org)
+
+The spec is the contract. It is:
+- The source of truth for wire format, function contracts, and invariants
+- Written in org-mode with Mermaid diagrams
+- Updated ONLY by spec-keeper or with spec-keeper review
+- Versioned via L0→L3 progressive hardening
+
+Agents MUST NOT edit spec/ without explicit spec-keeper approval.
+
+** C4 Architecture (docs/architecture/c4/)
+
+The C4 diagrams are the system blueprint. They are:
+- Consolidated in system-landscape.org with all four levels
+- Updated WHENEVER a service boundary changes
+- Validated by bin/c4-check before any platform/ commit
+- The visual contract for system decomposition
+
+Update triggers:
+- New service added
+- Service renamed or removed
+- Data flow changes between containers
+- External system integration added
+
+** ADRs (docs/architecture/adr/)
+
+Architecture Decision Records capture decisions with context:
+- One file per decision: NNNN-slug.md
+- Index in index.yml
+- Include refutation condition for revisiting
+- Never deleted; superseded by new ADRs
+
+** Working Discipline (docs/working/)
+
+Process documentation for agents and humans:
+- Stacking convention
+- Multi-agent coordination
+- CPRR notes protocol
+- Push discipline
+
+Updated when process changes; referenced from CLAUDE.md and AGENTS.md.
+
+** Runbooks (runbooks/)
+
+Operational playbooks in TOML format:
+- One file per incident class
+- Include: symptoms, diagnosis, remediation, escalation
+- Updated when new incident patterns discovered
+- Referenced from CPRR table for refutation response
+
+** Platform Service Docs (platform/<svc>/docs/)
+
+Each service maintains:
+- api.org: API reference (endpoints, schemas, examples)
+- code-diagram.org: Code-level class/namespace diagrams
+- README.md: Service overview and local development
+
+Generated or maintained by service owner.
+
+* Documentation Validation
+
+** bin/c4-check
+
+Validates C4 diagram consistency:
+- All services in Container diagram have corresponding Component diagram
+- All external systems in Context diagram are referenced
+- Mermaid syntax is valid
+- No orphan containers
+
+Run before any platform/ commit.
+
+** bin/docs-check
+
+Validates documentation structure:
+- All required files exist
+- ADR index matches ADR files
+- No broken org-mode links
+- No broken cross-references
+
+Run in CI weekly.
+
+* Cross-Reference Rules
+
+1. Spec files reference ADRs for rationale
+2. ADRs reference spec sections they implement
+3. C4 diagrams reference spec/L1-wire.org for trace propagation
+4. Runbooks reference CPRR conjectures they respond to
+5. CLAUDE.md and AGENTS.md reference docs/working/
+
+* Maintenance Protocol
+
+** Before Committing Code
+
+1. If service boundary changed → update C4 Container diagram
+2. If new external system → update C4 Context diagram
+3. If API changed → update platform/<svc>/docs/api.org
+4. If major refactor → update code diagrams
+
+** Before Opening PR
+
+1. Run bin/c4-check if platform/ changed
+2. Run bin/docs-check if docs/ changed
+3. Verify cross-references are not broken
+
+** After Incident
+
+1. If new incident class → create runbook
+2. If C-5 violation → update conformance harness AND docs
+
+* Documentation Review
+
+| Document type | Reviewer       | Review trigger       |
+|---------------|----------------|----------------------|
+| spec/*        | spec-keeper    | Every change         |
+| C4 diagrams   | spine-engineer | Service change       |
+| ADRs          | spec-keeper    | Every change         |
+| Runbooks      | spine-engineer | Incident resolution  |
+| Platform docs | service owner  | API/code change      |

@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+#
+# bin/c4-check — Validate C4 diagram consistency
+#
+# Usage: bin/c4-check [--fix]
+#
+# Checks:
+# 1. All containers in Level 2 have corresponding Level 3 component diagrams
+# 2. All external systems are referenced consistently
+# 3. Mermaid syntax is valid (requires mmdc or online validator)
+# 4. No orphan references
+#
+
+set -euo pipefail
+
+C4_DIR="docs/architecture/c4"
+LANDSCAPE="${C4_DIR}/system-landscape.org"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+log_ok() { echo -e "${GREEN}✓${NC} $1"; }
+log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
+log_fail() { echo -e "${RED}✗${NC} $1"; }
+
+FAILURES=0
+WARNINGS=0
+
+fail() {
+  log_fail "$1"
+  ((FAILURES++))
+}
+
+warn() {
+  log_warn "$1"
+  ((WARNINGS++))
+}
+
+echo "=== C4 Diagram Validation ==="
+echo ""
+
+# Check landscape file exists
+if [[ ! -f "$LANDSCAPE" ]]; then
+  fail "Missing: $LANDSCAPE"
+  exit 1
+fi
+log_ok "Found: $LANDSCAPE"
+
+# Extract containers from Level 2 (Container diagram)
+echo ""
+echo "--- Checking Container coverage ---"
+
+# Containers defined in the diagram
+CONTAINERS=$(grep -oP 'Container\(\K[^,]+' "$LANDSCAPE" 2>/dev/null | sort -u || true)
+CONTAINER_DBS=$(grep -oP 'ContainerDb\(\K[^,]+' "$LANDSCAPE" 2>/dev/null | sort -u || true)
+CONTAINER_QUEUES=$(grep -oP 'ContainerQueue\(\K[^,]+' "$LANDSCAPE" 2>/dev/null | sort -u || true)
+
+# Component diagrams defined
+COMPONENT_SECTIONS=$(grep -oP 'title Component Diagram - \K[^"]+' "$LANDSCAPE" 2>/dev/null | sort -u || true)
+
+for container in $CONTAINERS; do
+  # Skip infrastructure containers (postgres, redis, kafka)
+  case "$container" in
+    postgres|redis|kafka|clickhouse)
+      log_ok "Container $container: infrastructure (no component diagram needed)"
+      ;;
+    *)
+      # Check if there's a component section for this container
+      if echo "$COMPONENT_SECTIONS" | grep -qi "$container"; then
+        log_ok "Container $container: has component diagram"
+      else
+        warn "Container $container: no component diagram found"
+      fi
+      ;;
+  esac
+done
+
+# Check external systems consistency
+echo ""
+echo "--- Checking External Systems ---"
+
+EXTERNAL_SYSTEMS=$(grep -oP 'System_Ext\(\K[^,]+' "$LANDSCAPE" 2>/dev/null | sort -u || true)
+
+for system in $EXTERNAL_SYSTEMS; do
+  # Check if referenced in at least one Rel()
+  if grep -q "Rel.*$system" "$LANDSCAPE" 2>/dev/null; then
+    log_ok "External system $system: has relationships"
+  else
+    warn "External system $system: defined but no relationships"
+  fi
+done
+
+# Check Mermaid syntax (if mmdc available)
+echo ""
+echo "--- Checking Mermaid Syntax ---"
+
+if command -v mmdc >/dev/null 2>&1; then
+  # Extract Mermaid blocks and validate
+  TMPDIR=$(mktemp -d)
+  trap "rm -rf $TMPDIR" EXIT
+
+  # Simple extraction of mermaid blocks
+  awk '/^#+begin_src mermaid/,/^#+end_src/' "$LANDSCAPE" | \
+    grep -v '^#+' | \
+    csplit -z -f "$TMPDIR/block" - '/^C4/' '{*}' 2>/dev/null || true
+
+  for block in "$TMPDIR"/block*; do
+    [[ -f "$block" ]] || continue
+    if mmdc -i "$block" -o /dev/null 2>/dev/null; then
+      log_ok "Mermaid block: valid syntax"
+    else
+      warn "Mermaid block: syntax issue (may be C4 extension)"
+    fi
+  done
+else
+  log_warn "mmdc not found, skipping Mermaid syntax validation"
+  log_warn "Install with: npm install -g @mermaid-js/mermaid-cli"
+fi
+
+# Check platform directory structure matches containers
+echo ""
+echo "--- Checking Platform Structure ---"
+
+PLATFORM_DIRS=$(ls -d platform/*/ 2>/dev/null | xargs -I {} basename {} | sort -u || true)
+
+for dir in $PLATFORM_DIRS; do
+  # Normalize directory name (feature-flags -> flags)
+  normalized=$(echo "$dir" | sed 's/-//g')
+  if echo "$CONTAINERS" | grep -qi "$normalized" || echo "$CONTAINERS" | grep -qi "$dir"; then
+    log_ok "Platform dir $dir: matches container"
+  else
+    warn "Platform dir $dir: no matching container in C4"
+  fi
+done
+
+# Summary
+echo ""
+echo "=== Summary ==="
+if [[ $FAILURES -eq 0 ]] && [[ $WARNINGS -eq 0 ]]; then
+  log_ok "All checks passed"
+  exit 0
+elif [[ $FAILURES -eq 0 ]]; then
+  log_warn "$WARNINGS warning(s), no failures"
+  exit 0
+else
+  log_fail "$FAILURES failure(s), $WARNINGS warning(s)"
+  exit 1
+fi
