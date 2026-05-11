@@ -1,0 +1,422 @@
+#+title: Lifecycle Contract — Onboarding to Agent-Supported Trace Propagation
+#+author: trace-spine team
+#+date: 2026-05-10
+#+options: toc:2 num:t
+
+* Overview
+
+This document defines the full lifecycle of converting an existing application
+to agent-supported trace propagation under trace-spine governance. The L0–L3
+specs define /what must hold/; this document defines /how a service proves it
+holds/ at every stage from first instrumentation through production verification.
+
+#+begin_example
+Inventory → Instrumentation → Testing → Simulation → Deployment → Verification
+    ↓              ↓              ↓           ↓            ↓            ↓
+ Crossing       Adapter       Property     Fault        Staged       Trace
+  Audit        + Config       + Harness   Injection    Rollout     Continuity
+#+end_example
+
+A service is not /spine-compliant/ until every stage has evidence.
+
+* Why this contract exists
+
+An existing application has wire crossings that already carry traffic.
+Converting it to spine-compliant trace propagation is not a feature toggle —
+it touches every outbound call, every inbound handler, every async message.
+
+Without a lifecycle contract, teams discover gaps in production:
+- Adapter installed but =.trace-spine.yaml= missing crossings
+- Property tests pass locally but chaos exposes a carrier the adapter misses
+- Deployment succeeds but a background job drops trace context silently
+
+This document makes each gap impossible to reach without explicit evidence
+that the prior stage passed.
+
+* Stage 0: Crossing inventory
+
+| Field    | Value                                                       |
+|----------+-------------------------------------------------------------|
+| Contract | Every wire crossing in the service is identified and typed  |
+| Tool     | =.trace-spine.yaml= validated against JSON Schema           |
+| Gate     | Schema validation passes; crossing count > 0                |
+| Evidence | Committed =.trace-spine.yaml= with all crossings declared   |
+
+** What the inventory must capture
+
+For each crossing:
+
+| Crossing type   | Required fields                      | Example                        |
+|-----------------+--------------------------------------+--------------------------------|
+| =http_inbound=  | path, framework                      | =/api/checkout=, =rails=       |
+| =http_outbound= | target                               | =payments-service=             |
+| =kafka_produce= | topic                                | =order.placed=                 |
+| =kafka_consume= | topic, group                         | =order.placed=, =wms-fulfil=  |
+| =outbox=        | table                                | =public.outbox_events=         |
+| =aq_publish=    | channel                              | =trace-spine.conformance=      |
+| =aq_subscribe=  | channel                              | =trace-spine.conformance=      |
+
+** Validation
+
+#+begin_src bash
+# Validate .trace-spine.yaml against schema
+cd conformance && ./validate-config.sh ../path/to/service
+#+end_src
+
+** Refutation at this stage
+
+A wire crossing exists in the codebase (HTTP client call, Kafka producer, etc.)
+that is not declared in =.trace-spine.yaml=. Discovered by code audit or by
+the conformance harness reporting an unregistered crossing.
+
+** Agent role
+
+An agent (spine-engineer or adversary) can generate a draft =.trace-spine.yaml=
+by scanning the codebase for HTTP clients, Kafka producers/consumers, and outbox
+patterns. The inventory must be reviewed by a human before proceeding.
+
+* Stage 1: Instrumentation
+
+| Field    | Value                                                       |
+|----------+-------------------------------------------------------------|
+| Contract | Every declared crossing has an adapter wired in             |
+| Tool     | trace-spine adapter library for the service's substrate     |
+| Gate     | =continue_or_start= / =inject= / =extract= present at each crossing |
+| Evidence | Adapter code committed; CPRR conjecture filed               |
+
+** Adapter integration pattern
+
+For each crossing type, the adapter must be wired at the correct interception point:
+
+#+begin_src text
+http_inbound  → middleware wraps handler; extract() on entry, inject() on response
+http_outbound → HTTP client interceptor; inject() before send
+kafka_produce → producer interceptor; inject() into headers before publish
+kafka_consume → consumer wrapper; extract() from headers on receive
+outbox        → outbox writer includes traceparent column
+aq_publish    → message envelope includes traceparent field
+aq_subscribe  → message handler extracts traceparent from envelope
+#+end_src
+
+** =.trace-spine.yaml= for the service
+
+#+begin_src yaml
+version: 1
+service_name: checkout
+ingress_designated: false
+crossings:
+  http_inbound:
+    - path: /api/checkout
+      framework: rails
+  http_outbound:
+    - target: payments-service
+    - target: fraud-service
+  kafka_produce:
+    - topic: order.placed
+budget:
+  propagation_p99_us: 50
+#+end_src
+
+** CPRR entry
+
+Every instrumentation change files a conjecture in =cprr.org=:
+
+#+begin_src text
+C-id: C-N
+Conjecture: Service <name> propagates traceparent on all declared crossings
+Refutation: Conformance harness detects missing traceparent at any crossing
+Refinement: Adapter misconfigured; fix crossing-specific interception
+#+end_src
+
+** Refutation at this stage
+
+The conformance harness exercises each declared crossing and finds one where
+=traceparent= is absent or malformed. The adapter is fixed before proceeding.
+
+** Agent role
+
+An agent can generate adapter wiring code from the =.trace-spine.yaml= crossing
+declarations combined with the L1 function contracts. The agent must produce
+code that satisfies the =extract= / =inject= / =continue_or_start= ensures clauses.
+
+* Stage 2: Testing
+
+| Field    | Value                                                       |
+|----------+-------------------------------------------------------------|
+| Contract | Adapters satisfy L1 contracts under generated inputs        |
+| Tool     | Conformance harness + L2 property tests                     |
+| Gate     | CI must pass: static analysis + property tests + harness    |
+| Evidence | CI green; property test output with seed files              |
+
+** Required test categories
+
+| Category         | What it covers                              | Minimum                     |
+|------------------+---------------------------------------------+-----------------------------|
+| Static analysis  | clj-kondo / rubocop / type checking         | Zero violations             |
+| Unit contracts   | L1 function contracts (extract/inject/etc)  | All =ensures= clauses      |
+| Property: roundtrip | =extract(inject(ctx, carrier)) == ctx=   | 1000 generated examples     |
+| Property: continuation | Trace id preserved through handler    | 500 generated examples      |
+| Property: no_fabrication | Non-ingress rejects absent context  | 200 generated examples      |
+| Property: cross_substrate | Chain through all declared substrates | 100 generated examples  |
+| Property: budget | Propagation overhead < budget p99           | Bench passes                |
+| Conformance      | End-to-end against declared crossings       | =./run.sh= passes          |
+
+** Running the test suite
+
+#+begin_src bash
+# Full property test suite
+cd conformance && ./run-properties.sh
+
+# Specific property with seed replay
+cd conformance && ./run-properties.sh --property roundtrip --seed 42
+
+# Conformance harness against a service
+cd conformance && ./run.sh --config ../path/to/service/.trace-spine.yaml
+
+# Benchmark adapters against budget
+cd conformance && ./bench.sh clj
+#+end_src
+
+** Refutation at this stage
+
+A shrunken counterexample from a property test, recorded as a seed file in
+=conformance/seeds/=. The seed file is the bug report. The CI gate blocks
+merge until the counterexample is resolved.
+
+** Agent role
+
+An agent can run the full test suite, interpret failures, and propose fixes.
+The adversary role specifically runs property tests with adversarial generators
+(malformed headers, truncated carriers, oversized payloads) to stress adapter
+boundaries.
+
+* Stage 3: Simulation
+
+| Field    | Value                                                       |
+|----------+-------------------------------------------------------------|
+| Contract | Trace propagation survives realistic traffic and faults     |
+| Tool     | Docker Compose substrate stand-up + fault injection         |
+| Gate     | All crossings preserve trace context under fault conditions |
+| Evidence | Simulation run log; fault injection results                 |
+
+** Simulation environment
+
+The simulation runs the full substrate chain declared in =.trace-spine.yaml=
+against Docker Compose services with injected faults:
+
+#+begin_src text
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│  HTTP    │───→│  Kafka  │───→│   aq    │───→│ Outbox  │
+│ inbound  │    │ produce │    │ publish │    │  write  │
+└─────────┘    └─────────┘    └─────────┘    └─────────┘
+     ↑                                            │
+     └────────────── traceparent preserved? ───────┘
+#+end_src
+
+** Fault injection scenarios
+
+| Fault                        | Injection point         | Must survive            |
+|------------------------------+-------------------------+-------------------------|
+| 500ms latency spike          | Between any two hops    | Trace id preserved      |
+| Connection reset             | At crossing boundary    | Context not fabricated  |
+| Carrier header truncation    | HTTP outbound           | Graceful degradation    |
+| Kafka partition rebalance    | Consumer group          | No duplicate trace ids  |
+| Clock skew (±30s)            | Any service             | Span ordering preserved |
+
+** Simulation checklist
+
+#+begin_src text
+[ ] Docker Compose substrate services running
+[ ] Service under test deployed with trace-spine adapter
+[ ] Baseline trace: all hops produce connected spans
+[ ] Fault: latency spike — traceparent preserved
+[ ] Fault: connection reset — no fabricated trace ids
+[ ] Fault: header truncation — adapter returns None, does not crash
+[ ] Fault: partition rebalance — consumer resumes with correct context
+[ ] Cross-substrate chain: HTTP → Kafka → aq → outbox → Kafka preserves trace id
+#+end_src
+
+** Refutation at this stage
+
+Fault injection produces a scenario where trace context is lost, corrupted,
+or fabricated. The specific fault scenario and the resulting trace are recorded.
+The adapter must be revised before proceeding to deployment.
+
+** Agent role
+
+The adversary agent runs fault injection scenarios against the simulation
+environment. It can design novel fault combinations based on the crossing
+topology in =.trace-spine.yaml=.
+
+* Stage 4: Deployment
+
+| Field    | Value                                                       |
+|----------+-------------------------------------------------------------|
+| Contract | Staged rollout with per-stage verification gates            |
+| Tool     | CI/CD pipeline; =.aq= agent coordination                   |
+| Gate     | Each sub-stage: verify trace propagation or rollback        |
+| Evidence | PR merged; deployment ID; per-stage gate results            |
+
+** Deployment sub-stages
+
+| Sub-stage   | Verify                                               | Rollback trigger              |
+|-------------+------------------------------------------------------+-------------------------------|
+| Config      | =.trace-spine.yaml= deployed with service            | Config missing or invalid     |
+| Adapter     | Adapter library version pinned in dependencies       | Version mismatch              |
+| Canary      | Single instance; trace propagation verified on live traffic | Trace id discontinuity   |
+| Partial     | N% of instances; error rate ≤ baseline               | Error rate > baseline + 1%    |
+| Full        | All instances; conformance passes against production  | Conformance failure          |
+
+** Canary verification
+
+During canary deployment, an agent can verify trace propagation by:
+
+1. Sending a synthetic request with a known =traceparent=
+2. Waiting for the request to traverse all declared crossings
+3. Verifying the trace id appears in spans at each crossing
+4. Confirming no new trace ids were fabricated
+
+#+begin_src bash
+# Synthetic trace verification
+TRACE_ID=$(ulid | tr '[:upper:]' '[:lower:]' | head -c 32)
+SPAN_ID=$(openssl rand -hex 8)
+TRACEPARENT="00-${TRACE_ID}-${SPAN_ID}-01"
+
+curl -H "traceparent: ${TRACEPARENT}" https://canary.example.com/api/checkout
+
+# Query trace backend for completeness
+# Expect: spans at every declared crossing, all sharing TRACE_ID
+#+end_src
+
+** Refutation at this stage
+
+Any sub-stage gate failure triggers rollback. A trace id discontinuity in canary
+means the adapter is not wired correctly in the production environment (even if
+it passed in simulation). The deployment does not proceed until the specific
+crossing failure is diagnosed and fixed.
+
+** Agent role
+
+Agents coordinate deployment via =.aq= message channels. A spine-engineer agent
+can monitor canary traces in real time and signal rollback if discontinuity is
+detected.
+
+* Stage 5: Verification
+
+| Field    | Value                                                       |
+|----------+-------------------------------------------------------------|
+| Contract | Trace propagation sustained under production traffic        |
+| Tool     | Trace backend queries; error monitoring; performance metrics |
+| Gate     | 48h watch clean; weekly report confirms no regression       |
+| Evidence | Trace continuity report; error rate baseline; budget check  |
+
+** Verification timeline
+
+| Period   | Check                                                  | Owner          |
+|----------+--------------------------------------------------------+----------------|
+| T+0h     | Deployment complete; baseline metrics captured         | deployer       |
+| T+1h     | Trace continuity: sample N traces, verify connected spans | deployer    |
+| T+4h     | Error monitoring: no new exceptions from adapter code  | deployer       |
+| T+24h    | Trace id discontinuity rate trending to zero           | spine-engineer |
+| T+48h    | 48h watch complete; no regression in propagation       | spine-engineer |
+| W(N+1)   | Weekly report: sustained compliance, budget within bounds | spec-keeper |
+
+** Trace continuity verification
+
+#+begin_src text
+For a sample of N traces in the verification window:
+  1. Select traces that traverse all declared crossings
+  2. Verify: trace_id is constant across all spans in the trace
+  3. Verify: parent-child span relationships form a connected DAG
+  4. Verify: no spans have fabricated trace ids (I-spine-no-fabrication)
+  5. Verify: propagation latency < budget p99 (I-spine-budget)
+#+end_src
+
+** Refutation at this stage
+
+Trace id discontinuity detected in production traffic during the watch period.
+A new CPRR conjecture is filed, the lifecycle restarts from the appropriate
+stage (typically Stage 2 or Stage 3), and the service's compliance status
+reverts until the new conjecture is resolved.
+
+** Agent role
+
+An agent can continuously sample production traces during the watch period,
+computing discontinuity rates and flagging regressions. The spec-keeper reviews
+the weekly report and signs off on compliance.
+
+* Per-service evidence record
+
+Every service onboarding to trace-spine produces a lifecycle record tracked
+in beads:
+
+#+begin_src bash
+bd create --title="Onboard <service-name> to trace-spine" \
+  --description="Lifecycle evidence for <service-name> spine compliance" \
+  --type=feature \
+  --priority=2
+#+end_src
+
+The record accumulates evidence as the service moves through stages:
+
+#+begin_src bash
+# Stage 0: Crossing inventory
+bd update <id> --notes="Stage 0: .trace-spine.yaml committed, N crossings declared"
+
+# Stage 1: Instrumentation
+bd update <id> --notes="Stage 1: Adapter wired at all crossings, CPRR C-N filed"
+
+# Stage 2: Testing
+bd update <id> --notes="Stage 2: CI green, PBT passed (N properties, M examples)"
+
+# Stage 3: Simulation
+bd update <id> --notes="Stage 3: Substrate simulation passed, K fault scenarios survived"
+
+# Stage 4: Deployment
+bd update <id> --notes="Stage 4: Canary verified, full rollout complete"
+
+# Stage 5: Verification
+bd update <id> --notes="Stage 5: 48h watch clean, W(N+1) report signed off"
+bd close <id>
+#+end_src
+
+* Lifecycle contract template
+
+For reference, the complete per-service onboarding contract:
+
+#+begin_example
+┌───────────────────────────────────────────────────────────────────────┐
+│ Service: <service-name> — Onboarding to trace-spine                  │
+├───────────┬───────────────────────────────────────────────────────────┤
+│ Stage     │ Contract                                                 │
+├───────────┼───────────────────────────────────────────────────────────┤
+│ Inventory │ .trace-spine.yaml declares all crossings; schema valid   │
+│ Instrument│ Adapter at each crossing; CPRR conjecture filed          │
+│ Test      │ L2 properties pass; conformance harness green            │
+│ Simulate  │ Substrate chain preserves trace id under fault injection │
+│ Deploy    │ Canary verified; staged rollout; all gates passed        │
+│ Verify    │ 48h production watch clean; W(N+1) report signed off    │
+└───────────┴───────────────────────────────────────────────────────────┘
+#+end_example
+
+* Relationship to existing specs
+
+| This document            | Existing spec        | Relationship                            |
+|--------------------------+----------------------+-----------------------------------------|
+| Stage 0 (Inventory)      | .trace-spine.yaml    | Schema defines crossing types           |
+| Stage 1 (Instrumentation)| L1-contracts.org     | Adapter must satisfy function contracts |
+| Stage 1 (Instrumentation)| cprr.org             | Conjecture filed per onboarding         |
+| Stage 2 (Testing)        | L2-properties.org    | Property tests exercised                |
+| Stage 3 (Simulation)     | L1-wire.org          | Wire format validated under fault       |
+| Stage 4 (Deployment)     | L0-claims.org        | Claims verified at each gate            |
+| Stage 5 (Verification)   | cprr.org             | Refutation closes or reopens entry      |
+
+* Cross-references
+
+- L0 claims (invariants): [[file:L0-claims.org]]
+- L1 wire format: [[file:L1-wire.org]]
+- L1 function contracts: [[file:L1-contracts.org]]
+- L2 properties: [[file:L2-properties.org]]
+- CPRR table: [[file:cprr.org]]
+- Runbooks: [[file:../runbooks/]]
+- JSON Schema: [[file:../conformance/schema/trace-spine.schema.json]]
