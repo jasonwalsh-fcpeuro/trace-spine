@@ -1,0 +1,464 @@
+#+title: DX Hooks — Local Instrumentation and Continuous Verification
+#+author: trace-spine team
+#+date: 2026-05-11
+#+options: toc:2 num:t
+
+* Overview
+
+This spec defines the hooks that Claude Code and opencode should fire during
+local development to catch invariant violations, test regressions, and
+diagram drift /before/ they reach CI.
+
+#+begin_example
+Developer edits code
+        │
+        ├── PreToolUse ──→ Schema validation (.trace-spine.yaml)
+        ├── PostToolUse ──→ Org-lint, C4 consistency
+        ├── PostCommit ───→ PBT smoke, conformance check
+        │
+        └── Periodic ────→ Log scan, load test baseline, diagram drift
+                           (via /loop or cron triggers)
+#+end_example
+
+The hooks are the enforcement layer that makes the lifecycle contract
+(=spec/lifecycle-contract.org=) practical for solo developers and agents.
+
+* Hook categories
+
+** 1. Event-driven hooks (Claude Code settings.json)
+
+These fire in response to specific Claude Code events.
+
+*** SessionStart — Prime workspace
+
+Already configured. Loads beads context for issue tracking.
+
+#+begin_src json
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "",
+      "hooks": [
+        {"type": "command", "command": "bd prime"},
+        {"type": "command", "command": "bin/org-lint --quiet || true"},
+        {"type": "command", "command": "bin/c4-check 2>/dev/null | tail -3 || true"}
+      ]
+    }]
+  }
+}
+#+end_src
+
+*** PreToolUse:Edit — Spec file guard
+
+When editing files under =spec/=, warn that spec-keeper review is required.
+
+#+begin_src json
+{
+  "PreToolUse": [{
+    "matcher": "Edit",
+    "hooks": [{
+      "type": "command",
+      "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -q '\"file_path\".*spec/'; then echo 'WARNING: spec/ edits require spec-keeper review (see CLAUDE.md)'; fi"
+    }]
+  }]
+}
+#+end_src
+
+*** PostToolUse:Write — Schema validation on config changes
+
+After writing =.trace-spine.yaml=, validate against JSON Schema.
+
+#+begin_src json
+{
+  "PostToolUse": [{
+    "matcher": "Write",
+    "hooks": [{
+      "type": "command",
+      "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -q 'trace-spine.yaml'; then cd conformance && ./validate-config.sh 2>/dev/null || echo 'SCHEMA VALIDATION FAILED'; fi"
+    }]
+  }]
+}
+#+end_src
+
+*** PostToolUse:Bash — Capture test output for CPRR
+
+After running test commands, extract pass/fail counts for conjecture evidence.
+
+#+begin_src json
+{
+  "PostToolUse": [{
+    "matcher": "Bash",
+    "hooks": [{
+      "type": "command",
+      "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -qE 'run-properties|kaocha|run.sh'; then echo 'TEST RUN DETECTED — consider bd update with evidence'; fi"
+    }]
+  }]
+}
+#+end_src
+
+** 2. Periodic hooks (via /loop)
+
+These run on a cadence during active development sessions.
+
+*** Log scan for invariant violations
+
+Scan local service logs for trace-spine invariant violations.
+
+#+begin_src text
+Hook:    /loop 5m log-scan
+Trigger: Every 5 minutes during active session
+Action:  Scan service logs for missing traceparent, malformed headers,
+         fabricated trace IDs
+#+end_src
+
+Implementation:
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-log-scan — Scan logs for I-spine-* violations
+set -euo pipefail
+
+LOG_DIRS=(
+  "platform/api/logs"
+  "platform/*/logs"
+  "/tmp/trace-spine-*.log"
+)
+
+VIOLATIONS=0
+
+for pattern in "${LOG_DIRS[@]}"; do
+  for log in $pattern; do
+    [[ -f "$log" ]] || continue
+
+    # I-spine-present: missing traceparent
+    if grep -q "traceparent.*missing\|no traceparent\|Missing trace" "$log" 2>/dev/null; then
+      echo "VIOLATION I-spine-present in $log"
+      VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+
+    # I-spine-wellformed: malformed header
+    if grep -qE "malformed traceparent|invalid trace.?id|parse.*traceparent.*failed" "$log" 2>/dev/null; then
+      echo "VIOLATION I-spine-wellformed in $log"
+      VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+
+    # I-spine-no-fabrication: trace originated at non-ingress
+    if grep -q "originating trace.*non-ingress\|ProgrammerError.*must not originate" "$log" 2>/dev/null; then
+      echo "VIOLATION I-spine-no-fabrication in $log"
+      VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+
+    # I-spine-no-leak: trace ID in response body
+    if grep -qE '[0-9a-f]{32}' "$log" 2>/dev/null | grep -q "response_body\|error_response"; then
+      echo "VIOLATION I-spine-no-leak in $log"
+      VIOLATIONS=$((VIOLATIONS + 1))
+    fi
+  done
+done
+
+if [[ $VIOLATIONS -gt 0 ]]; then
+  echo "TOTAL: $VIOLATIONS violation(s) found"
+  echo "Run: bd create --title='Invariant violation from log scan' --type=bug --priority=1"
+  exit 1
+fi
+
+echo "No invariant violations in logs"
+#+end_src
+
+*** PBT smoke run
+
+Run a quick subset of property tests to catch regressions during development.
+
+#+begin_src text
+Hook:    /loop 15m pbt-smoke
+Trigger: Every 15 minutes during active session, or after conformance/* edits
+Action:  Run property tests with reduced example count (fast feedback)
+#+end_src
+
+Implementation:
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-pbt-smoke — Quick property test smoke run
+set -euo pipefail
+
+cd conformance
+
+# Reduced example count for speed (50 instead of 1000)
+if [[ -f run-properties.sh ]]; then
+  ./run-properties.sh --quick 2>&1 | tee /tmp/trace-spine-pbt-smoke.log
+  EXIT=$?
+  if [[ $EXIT -ne 0 ]]; then
+    echo "PBT SMOKE FAILURE — seed file written to conformance/seeds/"
+    echo "Run: bd create --title='PBT regression: $(date +%Y-%m-%d)' --type=bug --priority=1"
+  fi
+  exit $EXIT
+fi
+
+echo "No run-properties.sh found; skipping PBT smoke"
+#+end_src
+
+*** Diagram drift detection
+
+Detect when code changes have made C4 diagrams stale.
+
+#+begin_src text
+Hook:    /loop 30m diagram-drift
+Trigger: Every 30 minutes, or after platform/**/deps.edn changes
+Action:  Compare C4 container list against platform/ directory
+#+end_src
+
+Implementation:
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-diagram-drift — Detect C4 diagram staleness
+set -euo pipefail
+
+LANDSCAPE="docs/architecture/c4/system-landscape.org"
+
+# Extract containers from C4
+C4_CONTAINERS=$(grep -oE 'Container\([a-z_]+' "$LANDSCAPE" 2>/dev/null \
+  | sed 's/Container(//' | sort -u)
+
+# Extract services from platform/
+PLATFORM_SERVICES=$(ls -d platform/*/ 2>/dev/null \
+  | xargs -I {} basename {} | sort -u)
+
+# Check for services not in C4
+DRIFT=0
+for svc in $PLATFORM_SERVICES; do
+  normalized=$(echo "$svc" | tr '-' '_' | tr -d '_')
+  if ! echo "$C4_CONTAINERS" | tr '-' '_' | tr -d '_' | grep -qi "$normalized"; then
+    echo "DRIFT: platform/$svc exists but has no C4 container"
+    DRIFT=$((DRIFT + 1))
+  fi
+done
+
+# Check for C4 containers not in platform/
+for container in $C4_CONTAINERS; do
+  case "$container" in
+    spa|admin|postgres|redis|kafka|clickhouse|catalog|cart|order)
+      # Known gaps: SPAs not scaffolded yet, infra, unscaffolded services
+      ;;
+    *)
+      normalized=$(echo "$container" | tr '_' '-')
+      if ! echo "$PLATFORM_SERVICES" | grep -qi "$normalized"; then
+        echo "DRIFT: C4 container '$container' has no platform/ directory"
+        DRIFT=$((DRIFT + 1))
+      fi
+      ;;
+  esac
+done
+
+# Check .trace-spine.yaml crossing count vs C4 relationships
+for svc_dir in platform/*/; do
+  svc=$(basename "$svc_dir")
+  config="$svc_dir/.trace-spine.yaml"
+  if [[ -f "$config" ]]; then
+    crossing_count=$(grep -cE '^\s+- (path|target|topic|table|channel):' "$config" 2>/dev/null || echo 0)
+    echo "OK: $svc has $crossing_count crossing(s) declared"
+  else
+    echo "NOTE: $svc has no .trace-spine.yaml (Stage 0 incomplete)"
+  fi
+done
+
+if [[ $DRIFT -gt 0 ]]; then
+  echo ""
+  echo "TOTAL: $DRIFT drift(s) detected"
+  echo "Update docs/architecture/c4/system-landscape.org and run bin/c4-check"
+  exit 1
+fi
+
+echo "No diagram drift detected"
+#+end_src
+
+*** Conformance harness (on commit)
+
+Run the conformance harness against any service with a =.trace-spine.yaml=.
+
+#+begin_src text
+Hook:    PostCommit or pre-push
+Trigger: After commits that touch platform/** or lib/**
+Action:  Run conformance harness for affected services
+#+end_src
+
+Implementation:
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-conformance-check — Run conformance for changed services
+set -euo pipefail
+
+# Find services changed in last commit
+CHANGED_SERVICES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null \
+  | grep '^platform/' \
+  | cut -d/ -f2 \
+  | sort -u)
+
+if [[ -z "$CHANGED_SERVICES" ]]; then
+  echo "No platform services changed"
+  exit 0
+fi
+
+FAILURES=0
+for svc in $CHANGED_SERVICES; do
+  config="platform/$svc/.trace-spine.yaml"
+  if [[ -f "$config" ]]; then
+    echo "Running conformance for $svc..."
+    if cd conformance && ./run.sh --config "../$config" 2>&1; then
+      echo "OK: $svc conformance passed"
+    else
+      echo "FAIL: $svc conformance failed"
+      FAILURES=$((FAILURES + 1))
+    fi
+    cd ..
+  else
+    echo "SKIP: $svc has no .trace-spine.yaml"
+  fi
+done
+
+if [[ $FAILURES -gt 0 ]]; then
+  echo "TOTAL: $FAILURES service(s) failed conformance"
+  exit 1
+fi
+#+end_src
+
+** 3. Telemetry hooks (agent observability)
+
+These produce structured output that agents (Claude Code, opencode) can parse
+to decide what to do next.
+
+*** Budget check — latency regression
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-budget-check — Check propagation latency against budget
+set -euo pipefail
+
+# Run microbenchmark for each adapter
+for adapter_dir in lib/*/; do
+  adapter=$(basename "$adapter_dir")
+  [[ -f "$adapter_dir/deps.edn" ]] || continue
+
+  echo "Benchmarking $adapter..."
+  result=$(cd conformance && ./bench.sh "$adapter" 2>/dev/null | grep "p99" || echo "p99: N/A")
+  p99=$(echo "$result" | grep -oE '[0-9]+' | head -1)
+
+  if [[ -n "$p99" ]] && [[ "$p99" -ge 50 ]]; then
+    echo "BUDGET VIOLATION: $adapter p99=${p99}µs (budget: 50µs)"
+    echo "  Conjecture C-4 may be refuted. Check spec/cprr.org"
+  else
+    echo "OK: $adapter p99=${p99:-N/A}µs"
+  fi
+done
+#+end_src
+
+*** CPRR auto-evidence
+
+After any test run, automatically suggest CPRR evidence updates.
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-cprr-evidence — Suggest CPRR updates from test results
+set -euo pipefail
+
+LOG="$1"  # Path to test output log
+
+if [[ ! -f "$LOG" ]]; then
+  echo "Usage: bin/dx-cprr-evidence <test-output-log>"
+  exit 1
+fi
+
+# Map test results to conjectures
+if grep -q "roundtrip.*PASS\|roundtrip.*ok" "$LOG"; then
+  echo "C-1: roundtrip property passed (supports conjecture)"
+fi
+if grep -q "cross_substrate.*PASS" "$LOG"; then
+  echo "C-2: cross-substrate chain preserved (supports conjecture)"
+fi
+if grep -q "no_fabrication.*PASS" "$LOG"; then
+  echo "C-3: no fabrication detected (supports conjecture)"
+fi
+if grep -q "budget.*PASS" "$LOG"; then
+  echo "C-4: propagation within budget (supports conjecture)"
+fi
+if grep -q "FAIL\|ERROR\|FAILURE" "$LOG"; then
+  echo ""
+  echo "FAILURES DETECTED — one or more conjectures may be refuted"
+  echo "Run: bin/cprr-add conjecture --commit HEAD --statement '...' --refutation '...'"
+fi
+#+end_src
+
+* Recommended settings.json
+
+Full =.claude/settings.json= incorporating all event-driven hooks:
+
+#+begin_src json
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "",
+      "hooks": [
+        {"type": "command", "command": "bd prime"},
+        {"type": "command", "command": "bin/org-lint --quiet 2>/dev/null | tail -1 || true"},
+        {"type": "command", "command": "bin/c4-check 2>/dev/null | tail -3 || true"},
+        {"type": "command", "command": "echo \"trace-spine session: $(date +%Y-%m-%dT%H:%M) | Trace-Id: $(ulid 2>/dev/null || date +%s | shasum | head -c 26 | tr a-z A-Z)\""}
+      ]
+    }],
+    "PreCompact": [{
+      "matcher": "",
+      "hooks": [
+        {"type": "command", "command": "bd prime"}
+      ]
+    }],
+    "PreToolUse": [{
+      "matcher": "Edit",
+      "hooks": [{
+        "type": "command",
+        "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -q '\"file_path\".*spec/'; then echo 'GUARD: spec/ edits require spec-keeper review'; fi"
+      }]
+    }],
+    "PostToolUse": [{
+      "matcher": "Write",
+      "hooks": [{
+        "type": "command",
+        "command": "if echo \"$CLAUDE_TOOL_INPUT\" | grep -q 'trace-spine.yaml'; then echo 'Validating .trace-spine.yaml...'; fi"
+      }]
+    }]
+  }
+}
+#+end_src
+
+* Periodic check schedule
+
+For use with Claude Code =/loop= or opencode equivalent:
+
+| Check          | Cadence | Script                   | What it catches                     |
+|----------------+---------+--------------------------+-------------------------------------|
+| Log scan       | 5m      | =bin/dx-log-scan=        | I-spine-* violations in service logs |
+| PBT smoke      | 15m     | =bin/dx-pbt-smoke=       | Property regressions from edits     |
+| Diagram drift  | 30m     | =bin/dx-diagram-drift=   | C4 ↔ platform/ desynchronization    |
+| Budget check   | 30m     | =bin/dx-budget-check=    | Latency regression (C-4)            |
+| Conformance    | on commit | =bin/dx-conformance-check= | Crossing contract violations      |
+| CPRR evidence  | after test | =bin/dx-cprr-evidence= | Conjecture support/refutation       |
+
+* Relationship to lifecycle contract
+
+| DX hook          | Lifecycle stage  | What it verifies early                 |
+|------------------+------------------+----------------------------------------|
+| Schema validation | Stage 0         | =.trace-spine.yaml= is valid           |
+| Log scan         | Stage 1          | Adapters wired correctly               |
+| PBT smoke        | Stage 2          | Properties hold under generated inputs |
+| Budget check     | Stage 2          | Propagation within 50µs budget         |
+| Conformance      | Stage 2          | Cross-substrate chain preserves trace  |
+| Diagram drift    | Stage 0          | Architecture docs match reality        |
+| CPRR evidence    | All stages       | Conjecture tracking stays current      |
+
+* Cross-references
+
+- Lifecycle contract: [[file:lifecycle-contract.org]]
+- L0 claims (invariants scanned for): [[file:L0-claims.org]]
+- L2 properties (PBT smoke runs): [[file:L2-properties.org]]
+- CPRR table (evidence targets): [[file:cprr.org]]
+- C4 diagrams (drift detection): [[file:../docs/architecture/c4/system-landscape.org]]
