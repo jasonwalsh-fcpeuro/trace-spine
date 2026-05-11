@@ -1,0 +1,878 @@
+#+title: Next.js Local Environment — Docker + Hooks + Telemetry
+#+author: trace-spine team
+#+date: 2026-05-11
+#+options: toc:2 num:t
+
+* Overview
+
+Full local development environment for a Next.js application instrumented with
+trace-spine. Everything runs in Docker Compose. Hooks fire from the host
+(Claude Code / opencode) against container logs, test output, and telemetry.
+
+** Multi-stack mirroring
+
+The trace-spine exploration focuses on Clojure/ClojureScript as the primary
+substrate, but the harness pattern is stack-agnostic. Mirrored versions of
+this environment spec exist (or should be created) for each target stack:
+
+| Stack              | App framework          | PBT library          | Debugger           | Status   |
+|--------------------+------------------------+----------------------+--------------------+----------|
+| Clojure/CLJS       | Ring + Re-frame        | test.check           | CIDER + nREPL      | Primary  |
+| Ruby/Rails         | Rails 7.2              | propcheck            | ruby/debug (rdbg)  | Done     |
+| Python/FastAPI     | FastAPI + Starlette    | hypothesis           | debugpy            | Planned  |
+| TypeScript/Next.js | Next.js 14 + React     | fast-check           | Node --inspect     | This doc |
+| Go/net-http        | net/http + chi         | rapid                | delve (dlv)        | Planned  |
+
+The Docker Compose shape is identical across stacks: app + postgres + redis +
+kafka + otel-collector + jaeger + mailpit. Only the =web= service image,
+debugger port protocol, PBT runner command, and framework-specific hooks change.
+The Claude Code harness pattern (Bash + MCP chrome + hooks engine) is unchanged.
+
+#+begin_example
+Host (macOS)
+├── Claude Code / opencode
+│   ├── SessionStart hooks ──→ docker compose ps, prisma migrate status
+│   ├── /loop 5m ────────────→ log scan, invariant check
+│   ├── /loop 15m ───────────→ PBT smoke, schema drift
+│   └── PostCommit ──────────→ conformance, CPRR evidence
+│
+└── Docker Compose
+    ├── web        (Next.js 14, port 3000, Node --inspect 9229)
+    ├── postgres   (PostgreSQL 16, port 5432)
+    ├── redis      (Redis 7, port 6379)
+    ├── kafka      (Kafka 3.7, port 9092)
+    ├── otel       (OpenTelemetry Collector, port 4318)
+    ├── jaeger     (Jaeger UI, port 16686)
+    └── mailpit    (Email catch, port 8025)
+#+end_example
+
+* Docker Compose services
+
+** docker-compose.yml
+
+#+begin_src yaml
+services:
+  # ── Next.js application ───────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"     # Next.js server
+      - "9229:9229"     # Node.js --inspect debugger
+    volumes:
+      - .:/app
+      - node_modules:/app/node_modules
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://trace_spine:trace_spine@postgres:5432/trace_spine_dev
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BROKERS: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel:4318
+      OTEL_SERVICE_NAME: ${SERVICE_NAME:-checkout}
+      TRACE_SPINE_ENABLED: "true"
+      TRACE_SPINE_INGRESS: "false"
+      NODE_OPTIONS: "--inspect=0.0.0.0:9229"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "
+        pnpm prisma migrate deploy &&
+        pnpm dev
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Database ───────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: trace_spine
+      POSTGRES_PASSWORD: trace_spine
+      POSTGRES_DB: trace_spine_dev
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trace_spine"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Cache + sessions + rate limiting ───────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Event streaming ────────────────────────────────────────
+  kafka:
+    image: bitnami/kafka:3.7
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_CFG_NODE_ID: 0
+      KAFKA_CFG_PROCESS_ROLES: controller,broker
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  # ── OpenTelemetry Collector ────────────────────────────────
+  otel:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    ports:
+      - "4317:4317"     # gRPC receiver
+      - "4318:4318"     # HTTP receiver
+      - "8888:8888"     # Prometheus metrics
+    volumes:
+      - ./config/otel-collector.yaml:/etc/otelcol-contrib/config.yaml
+    depends_on:
+      - jaeger
+
+  # ── Trace visualization ────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14268:14268"   # Jaeger collector HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+
+  # ── Email catch (development) ──────────────────────────────
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"     # Web UI
+      - "1025:1025"     # SMTP
+
+volumes:
+  pgdata:
+  node_modules:
+#+end_src
+
+** Dockerfile.dev
+
+#+begin_src dockerfile
+FROM node:20-slim
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+WORKDIR /app
+
+# Cache dependency install
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+
+# Generate Prisma client
+COPY prisma ./prisma
+RUN pnpm prisma generate
+
+COPY . .
+
+EXPOSE 3000 9229
+#+end_src
+
+** OTel Collector config
+
+#+begin_src yaml
+# config/otel-collector.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+  # Filter out health check spans
+  filter:
+    spans:
+      exclude:
+        match_type: strict
+        attributes:
+          - key: http.target
+            value: /api/health
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  logging:
+    loglevel: warn
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [filter, batch]
+      exporters: [otlp/jaeger, logging]
+#+end_src
+
+* Next.js instrumentation
+
+** package.json additions
+
+#+begin_src json
+{
+  "dependencies": {
+    "trace-spine-ts": "link:../../lib/ts",
+
+    "@opentelemetry/sdk-node": "^0.52.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.52.0",
+    "@opentelemetry/instrumentation-http": "^0.52.0",
+    "@opentelemetry/instrumentation-pg": "^0.43.0",
+    "@opentelemetry/instrumentation-ioredis": "^0.42.0",
+    "@opentelemetry/instrumentation-fetch": "^0.52.0",
+    "@opentelemetry/resources": "^1.25.0",
+    "@opentelemetry/semantic-conventions": "^1.25.0",
+
+    "@prisma/client": "^5.15.0",
+    "pino": "^9.2.0",
+    "pino-pretty": "^11.2.0"
+  },
+  "devDependencies": {
+    "fast-check": "^3.19.0",
+    "vitest": "^1.6.0",
+    "prisma": "^5.15.0"
+  }
+}
+#+end_src
+
+** Instrumentation: OpenTelemetry bootstrap
+
+#+begin_src typescript
+// instrumentation.ts  (Next.js auto-loads this file)
+import { NodeSDK } from "@opentelemetry/sdk-node";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { HttpInstrumentation } from "@opentelemetry/instrumentation-http";
+import { PgInstrumentation } from "@opentelemetry/instrumentation-pg";
+import { IORedisInstrumentation } from "@opentelemetry/instrumentation-ioredis";
+import { Resource } from "@opentelemetry/resources";
+import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
+
+const sdk = new NodeSDK({
+  resource: new Resource({
+    [ATTR_SERVICE_NAME]: process.env.OTEL_SERVICE_NAME ?? "trace-spine-nextjs",
+  }),
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT
+      ? `${process.env.OTEL_EXPORTER_OTLP_ENDPOINT}/v1/traces`
+      : "http://localhost:4318/v1/traces",
+  }),
+  instrumentations: [
+    new HttpInstrumentation(),
+    new PgInstrumentation(),
+    new IORedisInstrumentation(),
+  ],
+});
+
+sdk.start();
+#+end_src
+
+** Middleware: trace-spine extraction/injection
+
+#+begin_src typescript
+// middleware.ts  (Next.js middleware — runs on every request)
+import { NextRequest, NextResponse } from "next/server";
+import { TraceSpine } from "trace-spine-ts";
+
+const traceSpine = new TraceSpine({
+  ingress: process.env.TRACE_SPINE_INGRESS === "true",
+  serviceName: process.env.OTEL_SERVICE_NAME ?? "unknown",
+});
+
+export function middleware(request: NextRequest) {
+  const traceparent = request.headers.get("traceparent");
+  const result = traceSpine.continueOrStart(traceparent);
+
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set("traceparent", result.traceparent);
+
+  const response = NextResponse.next({
+    request: { headers: requestHeaders },
+  });
+
+  // Propagate traceparent on the response for downstream consumers
+  response.headers.set("traceparent", result.traceparent);
+
+  return response;
+}
+
+export const config = {
+  matcher: [
+    // Match all request paths except static files and _next internals
+    "/((?!_next/static|_next/image|favicon.ico).*)",
+  ],
+};
+#+end_src
+
+** Structured logging with pino
+
+#+begin_src typescript
+// lib/logger.ts
+import pino from "pino";
+import { trace, context } from "@opentelemetry/api";
+
+export const logger = pino({
+  level: process.env.LOG_LEVEL ?? "info",
+  transport:
+    process.env.NODE_ENV === "development"
+      ? { target: "pino-pretty" }
+      : undefined,
+  mixin() {
+    const span = trace.getSpan(context.active());
+    if (span) {
+      const spanContext = span.spanContext();
+      return {
+        trace_id: spanContext.traceId,
+        span_id: spanContext.spanId,
+        service: process.env.OTEL_SERVICE_NAME ?? "unknown",
+      };
+    }
+    return {};
+  },
+});
+#+end_src
+
+** Debug configuration
+
+#+begin_src typescript
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  output: "standalone",
+  experimental: {
+    instrumentationHook: true,
+  },
+};
+
+export default nextConfig;
+
+// Debug: Node.js inspector is enabled via NODE_OPTIONS="--inspect=0.0.0.0:9229"
+// in docker-compose environment variables.
+//
+// Attach from host:
+//   Open chrome://inspect in Chrome → Configure → add localhost:9229
+//   Or: node --inspect-brk -e '' (to test connectivity)
+//
+// From Claude Code:
+//   ! open "chrome://inspect/#devices"
+//   Or use the Chrome DevTools WebSocket: ws://localhost:9229
+#+end_src
+
+* Port map
+
+| Port  | Service           | URL                                    | Purpose                     |
+|-------+-------------------+----------------------------------------+-----------------------------|
+| 3000  | Next.js (web)     | http://localhost:3000                  | Application UI + API        |
+| 9229  | Node --inspect    | =chrome://inspect= or =ws://localhost:9229= | Remote debugger attach |
+| 5432  | PostgreSQL        | =psql -h localhost -U trace_spine=     | Direct database access      |
+| 6379  | Redis             | =redis-cli -h localhost=               | Cache inspection            |
+| 9092  | Kafka             | =kcat -b localhost:9092 -L=            | Topic listing, consume      |
+| 4317  | OTel (gRPC)       | —                                      | Trace/metric ingest (gRPC)  |
+| 4318  | OTel (HTTP)       | —                                      | Trace/metric ingest (HTTP)  |
+| 8888  | OTel (Prometheus) | http://localhost:8888/metrics          | Collector self-metrics      |
+| 16686 | Jaeger UI         | http://localhost:16686                 | Trace visualization         |
+| 8025  | Mailpit           | http://localhost:8025                  | Email catch UI              |
+| 1025  | Mailpit SMTP      | —                                      | SMTP for nodemailer         |
+
+* Hook integration
+
+** How hooks reach into containers
+
+Hooks run on the host and use =docker compose exec= or log file mounts to
+inspect container state:
+
+#+begin_src text
+Host hook                         Container
+─────────                         ─────────
+bin/dx-log-scan          ──→      docker compose logs web --since 5m
+bin/dx-pbt-smoke         ──→      docker compose exec web pnpm test -- --reporter=verbose
+bin/dx-conformance-check ──→      docker compose exec web pnpm run trace-spine:conformance
+bin/dx-budget-check      ──→      docker compose exec web pnpm run trace-spine:bench
+bin/dx-diagram-drift     ──→      (host-only, reads files)
+#+end_src
+
+** Adapted hook scripts for Next.js + Docker
+
+*** SessionStart
+
+#+begin_src json
+{
+  "SessionStart": [{
+    "matcher": "",
+    "hooks": [
+      {"type": "command", "command": "bd prime"},
+      {"type": "command", "command": "docker compose ps --format 'table {{.Name}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null | head -10 || echo 'Docker Compose not running'"},
+      {"type": "command", "command": "docker compose exec -T web pnpm prisma migrate status 2>/dev/null | tail -5 || true"},
+      {"type": "command", "command": "curl -sf http://localhost:3000/api/health >/dev/null && echo 'Next.js: UP on :3000' || echo 'Next.js: DOWN'"},
+      {"type": "command", "command": "curl -sf http://localhost:16686 >/dev/null && echo 'Jaeger: UP on :16686' || echo 'Jaeger: DOWN'"}
+    ]
+  }]
+}
+#+end_src
+
+*** /loop 5m — Log scan for invariant violations
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-log-scan-docker — Scan Next.js container logs for I-spine-* violations
+set -euo pipefail
+
+LOGS=$(docker compose logs web --since 5m --no-log-prefix 2>/dev/null)
+VIOLATIONS=0
+
+# I-spine-present: missing traceparent
+COUNT=$(echo "$LOGS" | grep -ci "traceparent.*missing\|no.traceparent\|TraceSpine.*MissingContext" || true)
+if [[ "$COUNT" -gt 0 ]]; then
+  echo "VIOLATION I-spine-present: $COUNT occurrence(s) in last 5m"
+  VIOLATIONS=$((VIOLATIONS + COUNT))
+fi
+
+# I-spine-wellformed: malformed header
+COUNT=$(echo "$LOGS" | grep -ci "malformed.traceparent\|TraceSpine.*ParseError" || true)
+if [[ "$COUNT" -gt 0 ]]; then
+  echo "VIOLATION I-spine-wellformed: $COUNT occurrence(s)"
+  VIOLATIONS=$((VIOLATIONS + COUNT))
+fi
+
+# I-spine-no-fabrication: internal origination
+COUNT=$(echo "$LOGS" | grep -ci "ProgrammerError.*originate\|TraceSpine.*FabricationError" || true)
+if [[ "$COUNT" -gt 0 ]]; then
+  echo "VIOLATION I-spine-no-fabrication: $COUNT occurrence(s)"
+  VIOLATIONS=$((VIOLATIONS + COUNT))
+fi
+
+# I-spine-no-leak: trace ID in response body
+COUNT=$(echo "$LOGS" | grep -cE '"trace_id":"[0-9a-f]{32}".*response_body' || true)
+if [[ "$COUNT" -gt 0 ]]; then
+  echo "VIOLATION I-spine-no-leak: $COUNT occurrence(s)"
+  VIOLATIONS=$((VIOLATIONS + COUNT))
+fi
+
+# Budget: slow propagation
+COUNT=$(echo "$LOGS" | grep -ci "TraceSpine.*BudgetExceeded\|propagation.*exceeded.*budget" || true)
+if [[ "$COUNT" -gt 0 ]]; then
+  echo "VIOLATION I-spine-budget: $COUNT occurrence(s)"
+  VIOLATIONS=$((VIOLATIONS + COUNT))
+fi
+
+# Summary
+if [[ $VIOLATIONS -gt 0 ]]; then
+  echo "---"
+  echo "TOTAL: $VIOLATIONS violation(s) in last 5m"
+  echo "View traces: http://localhost:16686"
+  exit 1
+fi
+
+echo "No violations in last 5m"
+#+end_src
+
+*** /loop 15m — PBT smoke
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-pbt-smoke-docker — Run property tests inside Next.js container
+set -euo pipefail
+
+echo "Running PBT smoke (quick mode)..."
+docker compose exec -T web pnpm test -- \
+  --reporter=verbose \
+  --testPathPattern='\.prop\.' \
+  2>&1 | tee /tmp/trace-spine-pbt-smoke.log
+
+EXIT=${PIPESTATUS[0]}
+
+if [[ $EXIT -ne 0 ]]; then
+  echo "PBT SMOKE FAILURE"
+  bin/dx-cprr-evidence /tmp/trace-spine-pbt-smoke.log
+fi
+
+exit $EXIT
+#+end_src
+
+*** /loop 30m — Trace continuity sampling
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-trace-continuity — Sample recent traces from Jaeger for discontinuity
+set -euo pipefail
+
+SERVICE="${OTEL_SERVICE_NAME:-checkout}"
+JAEGER="http://localhost:16686"
+
+# Fetch recent traces via Jaeger API
+TRACES=$(curl -sf "$JAEGER/api/traces?service=$SERVICE&limit=10&lookback=30m" \
+  | jq -r '.data[]' 2>/dev/null)
+
+if [[ -z "$TRACES" ]]; then
+  echo "No traces found in last 30m (is the app receiving traffic?)"
+  exit 0
+fi
+
+# Check each trace for discontinuity
+DISCONTINUITIES=0
+TRACE_COUNT=$(echo "$TRACES" | jq -s 'length')
+
+for i in $(seq 0 $((TRACE_COUNT - 1))); do
+  TRACE=$(echo "$TRACES" | jq -s ".[$i]")
+  TRACE_ID=$(echo "$TRACE" | jq -r '.traceID')
+  SPAN_COUNT=$(echo "$TRACE" | jq '.spans | length')
+  UNIQUE_TRACES=$(echo "$TRACE" | jq '[.spans[].traceID] | unique | length')
+
+  if [[ "$UNIQUE_TRACES" -gt 1 ]]; then
+    echo "DISCONTINUITY: trace $TRACE_ID has $UNIQUE_TRACES different trace IDs across $SPAN_COUNT spans"
+    DISCONTINUITIES=$((DISCONTINUITIES + 1))
+  fi
+done
+
+echo "Sampled $TRACE_COUNT traces: $DISCONTINUITIES discontinuity(s)"
+if [[ $DISCONTINUITIES -gt 0 ]]; then
+  echo "View: $JAEGER/search?service=$SERVICE"
+  exit 1
+fi
+#+end_src
+
+** Database hooks
+
+*** Migration drift check
+
+#+begin_src bash
+#!/usr/bin/env bash
+# bin/dx-migration-check — Detect pending migrations or schema drift
+set -euo pipefail
+
+STATUS=$(docker compose exec -T web pnpm prisma migrate status 2>/dev/null)
+
+PENDING=$(echo "$STATUS" | grep -c "Following migration.*not yet been applied" || true)
+if [[ "$PENDING" -gt 0 ]]; then
+  echo "PENDING MIGRATIONS:"
+  echo "$STATUS" | grep "not yet been applied"
+  echo "Run: docker compose exec web pnpm prisma migrate deploy"
+  exit 1
+fi
+
+# Check prisma schema is committed and matches
+SCHEMA_DIFF=$(docker compose exec -T web git diff --stat prisma/schema.prisma 2>/dev/null || true)
+if [[ -n "$SCHEMA_DIFF" ]]; then
+  echo "SCHEMA DRIFT: prisma/schema.prisma has uncommitted changes"
+  echo "$SCHEMA_DIFF"
+  exit 1
+fi
+
+echo "Database: migrations applied, none pending"
+#+end_src
+
+* Full hook schedule
+
+| Hook                    | Trigger     | Target            | Catches                              |
+|-------------------------+-------------+-------------------+--------------------------------------|
+| Docker status           | SessionStart | host              | Services down, unhealthy containers  |
+| Migration status        | SessionStart | postgres          | Pending migrations, schema drift     |
+| Next.js health          | SessionStart | web:3000          | App not booting                      |
+| Jaeger health           | SessionStart | jaeger:16686      | Telemetry pipeline broken            |
+| Log scan                | /loop 5m    | web logs          | I-spine-* violations                 |
+| PBT smoke               | /loop 15m   | web (vitest)      | Property regressions                 |
+| Trace continuity        | /loop 30m   | jaeger API        | Trace ID discontinuity in production |
+| Diagram drift           | /loop 30m   | host files        | C4 <-> platform/ desync             |
+| Budget check            | /loop 30m   | web (bench)       | Propagation latency regression       |
+| Migration drift         | PostCommit  | postgres          | Uncommitted schema changes           |
+| Conformance             | PostCommit  | web (pnpm run)    | Crossing contract violations         |
+| CPRR evidence           | after test  | host              | Conjecture tracking freshness        |
+| Spec guard              | PreToolUse  | host              | Unauthorized spec/ edits             |
+| Schema validation       | PostToolUse | host              | Invalid .trace-spine.yaml            |
+
+* Startup sequence
+
+#+begin_src bash
+# 1. Start everything
+docker compose up -d
+
+# 2. Wait for health
+docker compose ps  # all should show "healthy"
+
+# 3. Verify endpoints
+curl -sf http://localhost:3000/api/health && echo "Next.js OK"
+curl -sf http://localhost:16686             && echo "Jaeger OK"
+curl -sf http://localhost:8025              && echo "Mailpit OK"
+redis-cli -h localhost ping                 && echo "Redis OK"
+psql -h localhost -U trace_spine -d trace_spine_dev -c "SELECT 1" && echo "Postgres OK"
+
+# 4. Attach debugger (when needed)
+# Open chrome://inspect in Chrome
+# Click "Configure..." and add localhost:9229
+# The Next.js process will appear under "Remote Target"
+# Click "inspect" to open Chrome DevTools attached to the Node process
+
+# 5. View traces
+open http://localhost:16686
+#+end_src
+
+* Harness — Claude Code as orchestration hub
+
+Claude Code is the central harness that ties together the running app,
+debugger, browser automation, telemetry, and verification. It is the
+single process that has visibility into /all/ layers simultaneously.
+
+** Architecture
+
+#+begin_example
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Claude Code (harness)                                                   │
+│                                                                         │
+│  ┌──────────────┐  ┌───────────────┐  ┌──────────────┐                 │
+│  │ Bash tool     │  │ MCP: chrome   │  │ Hooks engine │                 │
+│  │ (docker,node, │  │ (Playwright   │  │ (periodic +  │                 │
+│  │  psql, curl)  │  │  via --chrome)│  │  event-driven│                 │
+│  └──────┬───────┘  └──────┬────────┘  └──────┬───────┘                 │
+│         │                 │                   │                          │
+│    docker compose    Chrome DevTools     SessionStart                   │
+│    exec / logs       Protocol            PreToolUse                     │
+│         │                │                PostToolUse                    │
+│         │                │                /loop cadence                  │
+└─────────┼────────────────┼────────────────┼─────────────────────────────┘
+          │                │                │
+          ▼                ▼                ▼
+┌──────────────┐  ┌──────────────┐  ┌──────────────────────────────────┐
+│ Docker       │  │ Chrome       │  │ Verification pipeline             │
+│ Compose      │  │ Browser      │  │                                   │
+│              │  │              │  │  log scan → PBT → conformance     │
+│ web:3000     │  │ localhost    │  │  → trace continuity → budget      │
+│ postgres     │  │   :3000      │  │  → diagram drift → CPRR evidence │
+│ redis        │  │ (render +   │  │                                   │
+│ kafka        │  │  DOM inspect)│  │  All results feed back into      │
+│ otel→jaeger  │  │              │  │  Claude Code context for          │
+│ inspect:9229 │  │              │  │  next-action decisions            │
+└──────────────┘  └──────────────┘  └──────────────────────────────────┘
+#+end_example
+
+** What Claude Code needs running
+
+Before Claude Code can operate as the full harness, these must be up:
+
+#+begin_src bash
+# 1. Docker Compose (app + infra + telemetry)
+docker compose up -d
+# Wait for healthy
+docker compose ps | grep -v healthy && echo "WAIT" || echo "ALL HEALTHY"
+
+# 2. Chrome with remote debugging (for MCP chrome tools)
+# macOS:
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/chrome-debug \
+  http://localhost:3000 &
+
+# 3. Claude Code with chrome MCP
+# The claude-in-chrome extension connects to the Chrome instance.
+# Claude Code uses mcp__claude-in-chrome__* tools to:
+#   - Navigate to pages
+#   - Read DOM / page text
+#   - Execute JavaScript (read trace headers from network panel)
+#   - Take screenshots for visual regression
+#   - Fill forms (checkout flow testing)
+
+# 4. Debugger (attach on demand)
+# Open chrome://inspect in Chrome
+# Add localhost:9229 to the network targets
+# When a breakpoint or `debugger` statement is hit, DevTools will pause
+#+end_src
+
+** Claude Code + Playwright via MCP chrome
+
+The =claude-in-chrome= MCP server gives Claude Code browser automation
+equivalent to Playwright, operating against the live Next.js app:
+
+*** Trace verification through the browser
+
+#+begin_src text
+Scenario: Verify checkout flow carries traceparent end-to-end
+
+1. Claude Code → mcp__claude-in-chrome__navigate
+   URL: http://localhost:3000/products
+
+2. Claude Code → mcp__claude-in-chrome__find
+   Find: "Add to Cart" button → click
+
+3. Claude Code → mcp__claude-in-chrome__navigate
+   URL: http://localhost:3000/checkout
+
+4. Claude Code → mcp__claude-in-chrome__read_network_requests
+   Filter: XHR to /api/checkout
+   Assert: request headers contain "traceparent" matching
+           ^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$
+
+5. Claude Code → Bash
+   curl -sf "http://localhost:16686/api/traces?service=checkout&limit=1"
+   Assert: trace spans form connected DAG, single trace_id throughout
+
+6. Claude Code → mcp__claude-in-chrome__read_console_messages
+   Pattern: "TraceSpine"
+   Assert: no error-level messages
+#+end_src
+
+*** Visual regression with GIF recording
+
+#+begin_src text
+Scenario: Record checkout flow for review
+
+1. Claude Code → mcp__claude-in-chrome__gif_creator
+   Start recording: "checkout-flow-trace-verify.gif"
+
+2. Navigate through checkout (address → shipping → payment → confirm)
+   Capture extra frames at each step transition
+
+3. Stop recording
+   Output: checkout-flow-trace-verify.gif for human review
+#+end_src
+
+*** DOM inspection for I-spine-no-leak
+
+#+begin_src text
+Scenario: Verify trace IDs don't leak to rendered HTML
+
+1. Claude Code → mcp__claude-in-chrome__navigate
+   URL: http://localhost:3000/orders/123
+
+2. Claude Code → mcp__claude-in-chrome__get_page_text
+   Search page text for 32-character hex strings
+
+3. Claude Code → mcp__claude-in-chrome__javascript_tool
+   Script: document.body.innerHTML.match(/[0-9a-f]{32}/g)
+   Assert: no matches (trace IDs must not appear in DOM)
+
+4. If violation found:
+   Claude Code → Bash
+   bd create --title="I-spine-no-leak: trace ID in order detail page" \
+     --type=bug --priority=1
+#+end_src
+
+** Debugger integration
+
+Claude Code can connect to the Node.js inspector when investigating
+invariant violations discovered by hooks:
+
+#+begin_src text
+Scenario: Hook detects I-spine-no-fabrication, need to inspect middleware
+
+1. Log scan hook reports: "VIOLATION I-spine-no-fabrication"
+
+2. Claude Code reads the violation log to identify the route/handler
+
+3. Claude Code → Bash
+   # Add a debugger statement to the trace-spine middleware
+   # In middleware.ts, add: debugger; before the continueOrStart call
+
+4. Developer triggers the request via browser or curl
+
+5. Claude Code → mcp__claude-in-chrome__navigate
+   URL: chrome://inspect/#devices
+   # Node process at localhost:9229 will show as paused
+   # Inspect: traceparent header value, request.headers, ingress config
+   # Determine: why continueOrStart raised FabricationError
+
+6. Claude Code reports findings and suggests fix
+#+end_src
+
+** Harness session lifecycle
+
+#+begin_src text
+┌─ Session Start ────────────────────────────────────────────────┐
+│ 1. bd prime (load beads context)                               │
+│ 2. docker compose ps (verify infra)                            │
+│ 3. curl localhost:3000/api/health (verify app)                 │
+│ 4. curl localhost:16686 (verify telemetry)                     │
+│ 5. Chrome with --remote-debugging-port=9222                    │
+│ 6. Generate Trace-Id for session                               │
+└────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─ Development Loop ─────────────────────────────────────────────┐
+│                                                                 │
+│  Edit code ──→ Hook: org-lint, spec guard                      │
+│       │                                                         │
+│  Every 5m ──→ Log scan (docker logs)                           │
+│       │        → violation? → bd create bug, attach debugger   │
+│       │                                                         │
+│  Every 15m ─→ PBT smoke (docker exec pnpm test --tag prop)    │
+│       │        → failure? → seed file, bd create bug            │
+│       │                                                         │
+│  Every 30m ─→ Trace continuity (Jaeger API)                    │
+│       │        → discontinuity? → investigate via chrome MCP   │
+│       │                                                         │
+│  Every 30m ─→ Diagram drift (host file compare)                │
+│       │        → drift? → update C4, run c4-check              │
+│       │                                                         │
+│  On commit ──→ Conformance check (docker exec pnpm run)       │
+│       │        → failure? → block push, bd create bug           │
+│       │                                                         │
+│  On demand ──→ Chrome MCP: navigate, inspect DOM, record GIF   │
+│       │        → visual regression? → screenshot + bd create    │
+│       │                                                         │
+│  On demand ──→ Debugger attach (chrome://inspect, ws:9229)     │
+│                → inspect runtime state at breakpoint            │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─ Session End ──────────────────────────────────────────────────┐
+│ 1. bd close completed issues                                   │
+│ 2. git add <files> && git commit                               │
+│ 3. git push                                                    │
+│ 4. bd dolt push                                                │
+└────────────────────────────────────────────────────────────────┘
+#+end_src
+
+** Required Claude Code configuration
+
+For the harness to work, Claude Code needs:
+
+| Requirement                  | How to configure                                   |
+|------------------------------+----------------------------------------------------|
+| Chrome MCP tools             | =claude-in-chrome= extension installed in Chrome   |
+| Bash access to docker        | Docker Desktop running; =docker compose= on PATH   |
+| Node.js inspector access     | Port 9229 exposed; =chrome://inspect= configured   |
+| Jaeger API access            | Port 16686 exposed in docker-compose               |
+| PostgreSQL client            | =psql= on PATH (=brew install libpq=)              |
+| Redis client                 | =redis-cli= on PATH (=brew install redis=)         |
+| Kafka client                 | =kcat= on PATH (=brew install kcat=)               |
+| beads                        | =bd= on PATH                                       |
+| Session hooks                | =.claude/settings.json= configured per this spec   |
+
+* Cross-references
+
+- DX hooks spec (generic): [[file:dx-hooks-spec.org]]
+- Lifecycle contract: [[file:lifecycle-contract.org]]
+- L0 claims (what log scan checks): [[file:L0-claims.org]]
+- L2 properties (what PBT smoke runs): [[file:L2-properties.org]]
+- UI design spec (what chrome MCP tests): [[file:ui-design-spec.org]]
