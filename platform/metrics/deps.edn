@@ -13,7 +13,7 @@
 
   ;; JSON
   metosin/jsonista          {:mvn/version "0.3.8"}
-  com.github.clj-commons/clj-yaml {:mvn/version "1.0.27"}
+  clj-commons/clj-yaml {:mvn/version "1.0.27"}
 
   ;; Kafka
   org.apache.kafka/kafka-clients {:mvn/version "3.7.0"}
