@@ -9,6 +9,25 @@ Full local development environment for a Rails application instrumented with
 trace-spine. Everything runs in Docker Compose. Hooks fire from the host
 (Claude Code / opencode) against container logs, test output, and telemetry.
 
+** Multi-stack mirroring
+
+The trace-spine exploration focuses on Clojure/ClojureScript as the primary
+substrate, but the harness pattern is stack-agnostic. Mirrored versions of
+this environment spec exist (or should be created) for each target stack:
+
+| Stack              | App framework          | PBT library          | Debugger           | Status  |
+|--------------------+------------------------+----------------------+--------------------+---------|
+| Clojure/CLJS       | Ring + Re-frame        | test.check           | CIDER + nREPL      | Primary |
+| Ruby/Rails         | Rails 7.2              | propcheck            | ruby/debug (rdbg)  | This doc |
+| Python/FastAPI     | FastAPI + Starlette    | hypothesis           | debugpy            | Planned |
+| TypeScript/Next.js | Next.js + React        | fast-check           | Node --inspect     | Planned |
+| Go/net-http        | net/http + chi         | rapid                | delve (dlv)        | Planned |
+
+The Docker Compose shape is identical across stacks: app + postgres + redis +
+kafka + otel-collector + jaeger + mailpit. Only the =web= service image,
+debugger port protocol, PBT runner command, and framework-specific hooks change.
+The Claude Code harness pattern (Bash + MCP chrome + hooks engine) is unchanged.
+
 #+begin_example
 Host (macOS)
 ├── Claude Code / opencode
