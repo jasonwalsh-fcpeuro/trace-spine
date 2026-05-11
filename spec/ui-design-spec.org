@@ -1,0 +1,472 @@
+#+title: UI Design Spec — Petstore Commerce Platform
+#+author: trace-spine team
+#+date: 2026-05-11
+#+options: toc:2 num:t
+
+* Overview
+
+This spec defines the three UI surfaces in the Petstore Commerce Platform.
+All UI containers are ClojureScript + Re-frame SPAs that must inject W3C
+=traceparent= on every outbound request to the API Gateway.
+
+#+begin_example
+┌─────────────────────────────────────────────────────────────────────┐
+│                    UI Surfaces                                      │
+├──────────────────┬──────────────────┬───────────────────────────────┤
+│   Storefront     │  Admin Dashboard │   Trace Explorer              │
+│   (customer)     │  (merchant/ops)  │   (spine-engineer/adversary)  │
+├──────────────────┼──────────────────┼───────────────────────────────┤
+│ ClojureScript    │ ClojureScript    │ ClojureScript                 │
+│ Re-frame         │ Re-frame         │ Re-frame                      │
+│ shadow-cljs      │ shadow-cljs      │ shadow-cljs                   │
+└────────┬─────────┴────────┬─────────┴──────────────┬────────────────┘
+         │                  │                        │
+         └──────── traceparent on every XHR ─────────┘
+                            │
+                    ┌───────▼────────┐
+                    │  API Gateway   │
+                    └────────────────┘
+#+end_example
+
+* Shared constraints
+
+** Trace propagation (mandatory)
+
+Every UI surface must:
+
+1. Generate a =traceparent= header for each XHR/fetch to the API Gateway
+2. Use the =lib/cljs= adapter (=trace-spine.cljs.core=)
+3. Call =continue-or-start= with =is-ingress: true= (browser is the ingress boundary)
+4. Pass trace context through Re-frame's interceptor chain
+5. Include =traceparent= in all =re-frame.http-fx= requests
+
+#+begin_src clojure
+;; Re-frame interceptor for trace propagation
+(def trace-interceptor
+  (re-frame/->interceptor
+    :id    :trace-spine
+    :before (fn [context]
+              (let [ctx (trace-spine/continue-or-start nil true)]
+                (assoc-in context [:coeffects :trace-context] ctx)))))
+
+;; HTTP effect handler wraps all outbound calls
+(reg-fx :http-xhrio
+  (fn [request]
+    (let [ctx (subscribe [:trace-context])]
+      (-> request
+          (assoc-in [:headers "traceparent"] (trace-spine/format ctx))
+          (ajax/send)))))
+#+end_src
+
+** Technology stack
+
+| Layer      | Choice                | Rationale                                   |
+|------------+-----------------------+---------------------------------------------|
+| Language   | ClojureScript 1.12    | Same substrate as backend; shared contracts |
+| Framework  | Re-frame              | Predictable state; interceptor chain        |
+| Build      | shadow-cljs           | npm interop; hot reload                     |
+| CSS        | Tailwind CSS          | Utility-first; no custom design system yet  |
+| Components | Headless UI (reagent) | Accessible primitives; style-agnostic       |
+| Router     | reitit-frontend       | Consistent with API Gateway routing         |
+| HTTP       | re-frame-http-fx      | Effect-driven; trace interceptor compatible |
+| Testing    | cljs.test + devcards  | Visual component testing                    |
+
+** Shared layout principles
+
+- Responsive: mobile-first, breakpoints at =sm= =md= =lg= =xl=
+- Accessible: WCAG 2.1 AA minimum; keyboard navigation; screen reader labels
+- Performance: initial bundle < 200KB gzipped; lazy-load non-critical routes
+- Error states: every async operation has loading / success / error states
+- Empty states: every list view has an empty state with guidance
+
+* Surface 1: Storefront SPA
+
+** Purpose
+
+Customer-facing shopping experience. This is the primary ingress boundary where
+most traces originate.
+
+** Directory
+
+=platform/storefront/= (to be scaffolded)
+
+** Personas
+
+| Persona        | Goals                                        |
+|----------------+----------------------------------------------|
+| Browsing buyer | Search products, compare, read reviews        |
+| Checkout buyer | Cart → address → payment → confirmation flow |
+| Returning buyer | Order history, re-order, track shipments     |
+| Gift buyer     | Gift card purchase and send                   |
+
+** Information architecture
+
+#+begin_example
+/                        Home (featured products, promotions)
+/products                Product listing (search, filter, sort)
+/products/:slug          Product detail (images, specs, reviews)
+/cart                    Shopping cart (edit quantities, remove)
+/checkout                Multi-step checkout
+  /checkout/address        Shipping address
+  /checkout/shipping       Shipping method
+  /checkout/payment        Payment method + wallet application
+  /checkout/review         Order review + place order
+/orders                  Order history
+/orders/:id              Order detail + tracking
+/account                 Account settings
+/account/wallet          Wallet balance, gift cards, loyalty
+/account/addresses       Saved addresses
+#+end_example
+
+** Key screens
+
+*** Home
+
+| Element           | Description                                   | Data source      |
+|-------------------+-----------------------------------------------+------------------|
+| Hero banner       | Promotional banner with CTA                   | Feature flags    |
+| Featured products | 4-8 products, personalized if logged in       | Catalog + metrics |
+| Category grid     | Top-level categories with images              | Catalog          |
+| Recently viewed   | Client-side; last 10 products                 | Local storage    |
+
+*** Product listing
+
+| Element         | Description                                     | Data source |
+|-----------------+-------------------------------------------------+-------------|
+| Search bar      | Full-text search with autocomplete              | Catalog     |
+| Filter sidebar  | Category, price range, brand, availability      | Catalog     |
+| Sort controls   | Relevance, price, newest, rating                | Client-side |
+| Product cards   | Image, title, price, rating, add-to-cart button | Catalog     |
+| Pagination      | Infinite scroll with intersection observer      | Catalog     |
+
+*** Product detail
+
+| Element            | Description                                  | Data source |
+|--------------------+----------------------------------------------+-------------|
+| Image gallery      | Primary + thumbnails; zoom on hover          | Catalog     |
+| Product info       | Title, price, SKU, availability              | Catalog     |
+| Variant selector   | Size, color, etc.                            | Catalog     |
+| Add to cart        | Quantity + button; instant feedback           | Cart        |
+| Product specs      | Accordion with technical details             | Catalog     |
+| Reviews            | Rating distribution + review list            | Catalog     |
+
+*** Checkout flow
+
+| Step     | Fields                                             | Validation             |
+|----------+----------------------------------------------------+------------------------|
+| Address  | Name, street, city, state, zip, country            | Real-time; USPS verify |
+| Shipping | Method selection (standard, express, overnight)    | Carrier rate fetch     |
+| Payment  | Card (Stripe Elements), PayPal, wallet application | PCI-compliant; iframe  |
+| Review   | Order summary, edit links, place order button      | Idempotency key        |
+
+*** Trace contract for checkout
+
+The checkout flow is the highest-value trace in the system:
+
+#+begin_src text
+Browser (traceparent created)
+  → API Gateway (extract, child span)
+    → Fraud Service (score request)
+    → Order Service (create order)
+      → Payment Service (charge)
+        → Stripe (external; trace ends)
+      → Kafka (order.created event)
+        → WMS (fulfill order)
+#+end_src
+
+Every step in this chain must share the same =trace-id=. The storefront
+SPA is responsible for originating the trace and attaching it to the initial
+=/checkout= POST.
+
+** State management
+
+#+begin_src text
+app-db
+├── :user          {:id, :email, :name, :logged-in?}
+├── :cart          {:items [{:product-id, :variant-id, :qty, :price}], :total}
+├── :checkout      {:step, :address, :shipping, :payment, :idempotency-key}
+├── :products      {:by-id {}, :listing {:results, :filters, :page}}
+├── :orders        {:by-id {}, :list []}
+├── :wallet        {:balance, :gift-cards [], :loyalty-points}
+├── :trace-context {:trace-id, :span-id, :flags}
+├── :feature-flags {:flags-by-key {}}
+└── :ui            {:loading #{}, :errors {}, :toasts []}
+#+end_src
+
+* Surface 2: Admin Dashboard
+
+** Purpose
+
+Merchant and operations portal. Read-heavy with occasional writes. Must carry
+=traceparent= so admin actions (flag changes, rule updates) are traceable
+to their operational impact.
+
+** Directory
+
+=platform/admin/= (to be scaffolded)
+
+** Personas
+
+| Persona        | Goals                                         |
+|----------------+-----------------------------------------------|
+| Merchant       | View sales, manage inventory, configure flags |
+| Ops engineer   | Monitor fraud rules, view experiments         |
+| Support agent  | Look up orders, issue refunds, check wallet   |
+
+** Information architecture
+
+#+begin_example
+/admin                         Dashboard overview
+/admin/orders                  Order management (search, filter)
+/admin/orders/:id              Order detail (refund, cancel, notes)
+/admin/products                Product catalog management
+/admin/products/:id            Product edit (variants, pricing, images)
+/admin/inventory               Inventory levels, low-stock alerts
+/admin/customers               Customer lookup
+/admin/customers/:id           Customer detail (orders, wallet, history)
+/admin/payments                Payment transactions (search, refund)
+/admin/fraud                   Fraud dashboard
+/admin/fraud/rules             Fraud rule editor
+/admin/fraud/blocklists        Blocklist management
+/admin/experiments             A/B experiments (create, monitor, conclude)
+/admin/experiments/:id         Experiment detail (assignment, results)
+/admin/flags                   Feature flag management
+/admin/flags/:id               Flag detail (targeting, rollout, history)
+/admin/metrics                 Analytics dashboard
+/admin/wallet                  Wallet operations (issue credit, gift cards)
+#+end_example
+
+** Key screens
+
+*** Dashboard overview
+
+| Element            | Description                                   | Data source         |
+|--------------------+-----------------------------------------------+---------------------|
+| Revenue today      | Card with sparkline vs. previous day          | Metrics             |
+| Orders today       | Count + fulfillment status breakdown          | Order + WMS         |
+| Fraud alerts       | High-risk orders requiring review             | Fraud               |
+| Active experiments | Running experiments with key metrics          | Metrics + Flags     |
+| System health      | Service status indicators (green/yellow/red)  | API Gateway health  |
+
+*** Fraud rule editor
+
+| Element          | Description                                    | Data source |
+|------------------+------------------------------------------------+-------------|
+| Rule list        | Table: name, type, status, hit count           | Fraud       |
+| Rule builder     | Visual rule builder (conditions + actions)      | Fraud       |
+| Simulation       | Test rule against historical transactions      | Fraud       |
+| Audit log        | Who changed what, when (traceable via spine)   | Fraud       |
+
+*** Feature flag management
+
+| Element           | Description                                   | Data source |
+|-------------------+-----------------------------------------------+-------------|
+| Flag list         | Table: key, status, rollout %, last changed    | Flags       |
+| Flag editor       | Targeting rules, segments, rollout percentage  | Flags       |
+| Flag history      | Timeline of changes (linked to trace-ids)      | Flags       |
+| Kill switch       | Emergency disable with confirmation dialog     | Flags       |
+
+*** Experiment dashboard
+
+| Element          | Description                                    | Data source        |
+|------------------+------------------------------------------------+--------------------|
+| Experiment list  | Active, concluded, draft experiments           | Metrics            |
+| Assignment view  | Variant split visualization                    | Metrics            |
+| Results panel    | Conversion rate, confidence interval, p-value  | Metrics/ClickHouse |
+| Conclude action  | Winner selection with rollout-to-flag link     | Metrics + Flags    |
+
+** State management
+
+#+begin_src text
+app-db
+├── :user          {:id, :email, :role, :permissions []}
+├── :dashboard     {:revenue, :orders, :alerts, :experiments}
+├── :orders        {:by-id {}, :list {:results, :filters, :page}}
+├── :products      {:by-id {}, :list {:results, :filters, :page}}
+├── :fraud         {:rules [], :blocklists [], :alerts []}
+├── :experiments   {:by-id {}, :list []}
+├── :flags         {:by-id {}, :list []}
+├── :metrics       {:charts {}, :queries {}}
+├── :trace-context {:trace-id, :span-id, :flags}
+└── :ui            {:loading #{}, :errors {}, :sidebar-open?, :toasts []}
+#+end_src
+
+* Surface 3: Trace Explorer
+
+** Purpose
+
+Internal tool for spine-engineers and adversary agents to visualize trace
+propagation across the substrate chain. This is the /verification/ UI — it
+makes Stage 5 of the lifecycle contract visible.
+
+** Directory
+
+=platform/trace-explorer/= (to be scaffolded)
+
+** Personas
+
+| Persona         | Goals                                          |
+|-----------------+------------------------------------------------|
+| Spine engineer  | Verify trace continuity across crossings       |
+| Adversary agent | Identify broken spans, missing propagation     |
+| Spec keeper     | Review W(N+1) compliance reports               |
+
+** Information architecture
+
+#+begin_example
+/traces                        Trace search (by trace-id, service, time range)
+/traces/:trace-id              Trace waterfall (all spans in the trace)
+/traces/:trace-id/graph        DAG view (span parent-child relationships)
+/crossings                     Crossing inventory (from .trace-spine.yaml)
+/crossings/:service            Service crossing detail
+/compliance                    Compliance dashboard
+/compliance/report/:week       Weekly compliance report (W(N) view)
+/conformance                   Conformance harness results
+/conformance/:run-id           Run detail (properties, seeds, failures)
+#+end_example
+
+** Key screens
+
+*** Trace waterfall
+
+| Element           | Description                                    | Data source      |
+|-------------------+------------------------------------------------+------------------|
+| Trace header      | Trace ID, duration, span count, status         | Trace backend    |
+| Waterfall chart   | Horizontal bars showing span timing            | Trace backend    |
+| Span detail panel | Click span → metadata, tags, crossing type     | Trace backend    |
+| Continuity check  | Visual indicator: trace-id consistent? parent chain connected? | Computed |
+| Crossing overlay  | Highlights which spans cross service boundaries | .trace-spine.yaml |
+
+*** DAG view
+
+| Element           | Description                                    | Data source |
+|-------------------+------------------------------------------------+-------------|
+| Span graph        | Directed acyclic graph of parent-child spans   | Trace backend |
+| Service coloring  | Each service gets a distinct color              | Computed    |
+| Broken edges      | Red edges where trace-id changes (violation)   | Computed    |
+| Orphan detection  | Spans with no parent that aren't ingress       | Computed    |
+
+*** Compliance dashboard
+
+| Element             | Description                                  | Data source        |
+|---------------------+----------------------------------------------+--------------------|
+| Service compliance  | Table: service, crossing count, pass rate    | Conformance runs   |
+| Weekly trend        | Line chart: compliance % over weeks          | Historical reports |
+| Violation log       | Recent I-spine-* violations with trace links | Conformance runs   |
+| Budget tracker      | p99 propagation latency per adapter          | Bench results      |
+
+*** Conformance run detail
+
+| Element            | Description                                   | Data source      |
+|--------------------+-----------------------------------------------+------------------|
+| Run metadata       | Date, duration, adapter, seed                  | Conformance      |
+| Property results   | Table: property name, status, example count   | Conformance      |
+| Failure detail     | Shrunken counterexample with seed file link   | Conformance/seeds |
+| Replay button      | Re-run failing property with same seed         | Conformance      |
+
+** State management
+
+#+begin_src text
+app-db
+├── :traces        {:by-id {}, :search {:results, :filters}}
+├── :crossings     {:by-service {}, :inventory []}
+├── :compliance    {:current-week, :reports-by-week {}, :violations []}
+├── :conformance   {:runs [], :current-run {}}
+├── :trace-context {:trace-id, :span-id, :flags}
+└── :ui            {:loading #{}, :errors {}, :selected-span, :view-mode}
+#+end_src
+
+* Visual design direction
+
+** Design tokens (to be refined in Figma)
+
+| Token              | Value                                        | Usage                  |
+|--------------------+----------------------------------------------+------------------------|
+| =--color-primary=  | #2563EB (blue-600)                           | Actions, links         |
+| =--color-success=  | #16A34A (green-600)                          | Passing, healthy       |
+| =--color-warning=  | #D97706 (amber-600)                          | Degraded, attention    |
+| =--color-danger=   | #DC2626 (red-600)                            | Failed, violation      |
+| =--color-surface=  | #FFFFFF / #0F172A (light/dark)               | Card backgrounds       |
+| =--color-muted=    | #64748B (slate-500)                          | Secondary text         |
+| =--font-sans=      | Inter                                        | UI text                |
+| =--font-mono=      | JetBrains Mono                               | Code, trace IDs, spans |
+| =--radius=         | 0.375rem (rounded-md)                        | Cards, buttons, inputs |
+| =--shadow=         | 0 1px 3px rgb(0 0 0 / 0.1)                  | Elevated surfaces      |
+
+** Component inventory (Figma deliverables)
+
+These are the components a designer should produce:
+
+*** Shared components
+
+| Component        | Variants                                       |
+|------------------+------------------------------------------------|
+| Button           | primary, secondary, danger, ghost; sm, md, lg  |
+| Input            | text, search, number; with/without icon        |
+| Select           | single, multi; with search                     |
+| Table            | sortable headers, row actions, pagination      |
+| Card             | stat card, list card, detail card              |
+| Badge            | success, warning, danger, info; with/without dot |
+| Toast            | success, error, info; with dismiss             |
+| Modal            | confirmation, form, detail                     |
+| Sidebar nav      | collapsible, with icons, active state          |
+| Breadcrumb       | with service/route context                     |
+| Empty state      | illustration + message + CTA                   |
+| Loading skeleton | card, table row, chart                         |
+| Error boundary   | inline error, full page error                  |
+
+*** Storefront-specific
+
+| Component          | Variants                                     |
+|--------------------+----------------------------------------------|
+| Product card       | grid, list; with/without quick-add           |
+| Image gallery      | thumbnails, zoom, full-screen                |
+| Cart drawer        | slide-over, with quantity controls            |
+| Checkout stepper   | horizontal steps with validation indicators  |
+| Payment form       | Stripe Elements wrapper + wallet toggle      |
+| Order timeline     | status steps with timestamps                 |
+
+*** Admin-specific
+
+| Component          | Variants                                     |
+|--------------------+----------------------------------------------|
+| Stat card          | number, sparkline, comparison                |
+| Data table         | with filters, bulk actions, export           |
+| Rule builder       | condition rows + action selector             |
+| Timeline           | audit log entries with diff view             |
+| Chart              | line, bar, pie; with annotations             |
+| Flag toggle        | with rollout slider and targeting summary    |
+
+*** Trace Explorer-specific
+
+| Component          | Variants                                     |
+|--------------------+----------------------------------------------|
+| Trace waterfall    | horizontal span bars with timing             |
+| Span detail        | collapsible panel with tags/metadata         |
+| DAG graph          | interactive node-link diagram                |
+| Compliance gauge   | circular progress with pass/fail count       |
+| Crossing map       | service topology with crossing annotations   |
+| Seed file viewer   | EDN syntax highlighting with copy button     |
+
+* Figma deliverable checklist
+
+#+begin_src text
+[ ] Design tokens (colors, typography, spacing, shadows)
+[ ] Shared component library (all variants listed above)
+[ ] Storefront: Home, Product listing, Product detail, Cart, Checkout (4 steps)
+[ ] Storefront: Order history, Order detail, Account, Wallet
+[ ] Admin: Dashboard, Orders, Products, Fraud rules, Experiments, Flags
+[ ] Trace Explorer: Search, Waterfall, DAG, Compliance, Conformance detail
+[ ] Responsive breakpoints: mobile (375px), tablet (768px), desktop (1280px)
+[ ] Dark mode variants for Trace Explorer (ops tool; dark-by-default)
+[ ] Loading, empty, and error states for each screen
+[ ] Interaction specs: hover, focus, active, disabled for all interactive elements
+#+end_src
+
+* Cross-references
+
+- C4 Container Diagram: [[file:../docs/architecture/c4/system-landscape.org]]
+- Trace propagation map: [[file:../docs/architecture/c4/system-landscape.org::*Trace Propagation Map]]
+- L1 wire format: [[file:L1-wire.org]]
+- L1 function contracts (lib/cljs adapter): [[file:L1-contracts.org]]
+- Lifecycle contract (Stage 5 verification): [[file:lifecycle-contract.org]]
