@@ -2,12 +2,12 @@
 #+AUTHOR: aygp-dr
 #+DESCRIPTION: Wire-discipline library for W3C traceparent propagation
 
-[[https://github.com/aygp-dr/trace-spine/actions][https://img.shields.io/github/actions/workflow/status/aygp-dr/trace-spine/ci.yml?branch=main&style=flat-square&logo=github&label=CI]]
-[[https://github.com/aygp-dr/trace-spine/blob/main/LICENSE][https://img.shields.io/badge/license-TBD-blue?style=flat-square]]
-[[https://www.w3.org/TR/trace-context/][https://img.shields.io/badge/W3C-Trace%20Context%20v00-005A9C?style=flat-square&logo=w3c]]
-[[https://clojure.org][https://img.shields.io/badge/Clojure-1.12-5881D8?style=flat-square&logo=clojure]]
-[[https://github.com/aygp-dr/trace-spine/tree/main/spec][https://img.shields.io/badge/spec-L0→L3-orange?style=flat-square]]
-[[https://github.com/aygp-dr/trace-spine/tree/main/docs/architecture/adr][https://img.shields.io/badge/ADRs-5-informational?style=flat-square]]
+[[https://github.com/aygp-dr/trace-spine/actions][https://img.shields.io/github/actions/workflow/status/aygp-dr/trace-spine/ci.yml.svg?branch=main&style=flat-square&logo=github&label=CI]]
+[[https://github.com/aygp-dr/trace-spine/blob/main/LICENSE][https://img.shields.io/badge/license-TBD-blue.svg?style=flat-square]]
+[[https://www.w3.org/TR/trace-context/][https://img.shields.io/badge/W3C-Trace%20Context%20v00-005A9C.svg?style=flat-square&logo=w3c]]
+[[https://clojure.org][https://img.shields.io/badge/Clojure-1.12-5881D8.svg?style=flat-square&logo=clojure]]
+[[https://github.com/aygp-dr/trace-spine/tree/main/spec][https://img.shields.io/badge/spec-L0%E2%86%92L3-orange.svg?style=flat-square]]
+[[https://github.com/aygp-dr/trace-spine/tree/main/docs/architecture/adr][https://img.shields.io/badge/ADRs-5-informational.svg?style=flat-square]]
 
 Wire-discipline library and CI harness that enforces W3C =traceparent=
 propagation across every wire crossing in the architecture.
